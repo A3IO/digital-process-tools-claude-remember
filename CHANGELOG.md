@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] — Bound consolidation prompt size so a huge archive can't stall saves
+
+### Fixed
+
+- **An oversized consolidation prompt could halt daily rotation** ([#122](https://github.com/Digital-Process-Tools/claude-remember/issues/122)) — [#96](https://github.com/Digital-Process-Tools/claude-remember/issues/96) (0.8.2) capped the *save* path, but the *consolidation* path still inlined the full staging set + `recent.md` + `archive.md` into one Haiku call with no size check. A large input overflowed the model window (`Prompt is too long`), so `run-consolidation.sh` logged `ERROR` and exited 1 — and it was self-reinforcing, since staging was never retired and re-fed identically on the next run (the #96 failure mode, one path over). The assembled prompt is now capped at `thresholds.consolidate_max_bytes` (default 600 KB, `0` disables). Unlike the save path it **skips** rather than truncates, because consolidation rewrites `recent.md`/`archive.md` and a truncated input would permanently drop archived memory.
+
+### Added
+
+- **Archive rotation keeps consolidation progressing** ([#122](https://github.com/Digital-Process-Tools/claude-remember/issues/122)) — when `archive.md` is the oversized bulk, `cmd_consolidate` rotates it to a dated sibling (`archive-YYYY-MM-DD.md`, cold storage — no memory lost) and retries once with a fresh archive. If there is nothing to rotate, the retry still overflows, or the retry's Haiku call errors, the rotation is undone and the original state is left intact. Follow-up [#124](https://github.com/Digital-Process-Tools/claude-remember/issues/124) tracks teaching recall to read the rotated siblings. Thanks to [@presempathy-awb](https://github.com/presempathy-awb) for the fix and thorough tests.
+
 ## [0.8.3] — Windows: resolve the claude.cmd shim before spawning
 
 ### Fixed
