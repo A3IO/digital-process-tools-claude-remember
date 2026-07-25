@@ -52,7 +52,9 @@ if ! ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null; then
     log "consolidation" "stale lock (PID $LOCK_PID dead), taking over"
     echo $$ > "$LOCK_FILE"
 fi
-trap 'rm -f "$LOCK_FILE"' EXIT
+# This trap REPLACES the cleanup trap lib-memory-dir.sh installed for
+# $REMEMBER_CONFIG (bash keeps a single EXIT trap), so remove it here too.
+trap 'rm -f "$LOCK_FILE" "$REMEMBER_CONFIG"' EXIT
 
 STAGING_DIR="${REMEMBER_DIR}"
 RECENT_FILE="${STAGING_DIR}/recent.md"

@@ -66,6 +66,9 @@ LAST_SAVE_FILE="${REMEMBER_DIR}/tmp/last-save.json"
 COOLDOWN_MARKER="${REMEMBER_DIR}/tmp/last-save-ts"
 TODAY_DATE=$(_remember_date +%Y-%m-%d)
 CLEANUP_FILES=()
+# The trap below REPLACES the cleanup trap lib-memory-dir.sh installed for
+# $REMEMBER_CONFIG (bash keeps a single EXIT trap), so remove it here too.
+CLEANUP_FILES+=("$REMEMBER_CONFIG")
 
 # Remove lock file and all accumulated temp files on exit.
 cleanup() { rm -f "$LOCK_FILE" "${CLEANUP_FILES[@]}"; }
