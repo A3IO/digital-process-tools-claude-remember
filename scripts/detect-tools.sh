@@ -94,6 +94,46 @@ export JQ
 # receive the path in Unix form (/d/Users/p), which would slug differently
 # (-d-Users-p). Convert back to the Windows form via cygpath before slugging
 # so we match the actual directory Claude Code created.
+# The sed program for the slug, assembled ONCE at source time. It used to be
+# built inside session_dir_slug, where every $(printf) forked a subshell — ~20
+# of them on a function the post-tool hook calls on every single tool call.
+_remember_build_slug_sed() {
+    local c cont
+    cont="$(printf '\200')-$(printf '\277')"
+    _REMEMBER_SLUG_SED=(
+        -e "s/$(printf '\360')[$(printf '\220')-$(printf '\277')][$cont][$cont]/--/g"
+        -e "s/[$(printf '\361')-$(printf '\363')][$cont][$cont][$cont]/--/g"
+        -e "s/$(printf '\364')[$(printf '\200')-$(printf '\217')][$cont][$cont]/--/g"
+        -e "s/$(printf '\340')[$(printf '\240')-$(printf '\277')][$cont]/-/g"
+        -e "s/[$(printf '\341')-$(printf '\354')][$cont][$cont]/-/g"
+        -e "s/$(printf '\355')[$(printf '\200')-$(printf '\237')][$cont]/-/g"
+        -e "s/[$(printf '\356')-$(printf '\357')][$cont][$cont]/-/g"
+        -e "s/[$(printf '\302')-$(printf '\337')][$cont]/-/g"
+        -e 's/[^a-zA-Z0-9]/-/g'
+    )
+}
+_remember_build_slug_sed
+
+# Non-ASCII: Claude Code slugs with `s.replace(/[^a-zA-Z0-9]/g, '-')` — checked
+# in the installed CLI bundle, and note there is no /u flag. So it replaces one
+# UTF-16 CODE UNIT per dash, not one character: BMP characters (é, 日, プ) give
+# one dash, but anything astral (emoji, and the Extension-B kanji that turn up
+# in Japanese name registries) is a surrogate PAIR and gives two.
+# Getting sed to agree portably is the whole problem, because every locale
+# answer is wrong somewhere:
+#   * ambient — on Git Bash/MSYS sed matched byte-wise even under
+#     LC_CTYPE=C.UTF-8, so a CJK path got three dashes per character, the slug
+#     missed ~/.claude/projects/<slug>/ entirely and the pipeline silently
+#     never ran (issue #144);
+#   * LC_ALL=C.utf8 — absent on macOS, and a missing locale falls back to C,
+#     which is byte-wise: the same bug, moved;
+#   * LC_ALL=en_US.UTF-8 — present on macOS, but then [a-z] follows collation
+#     and matches accented letters, so "café" keeps its é and never matches
+#     the slug Claude Code wrote.
+# So force byte semantics and collapse UTF-8 sequences by hand: a 4-byte
+# sequence is one surrogate pair, hence two dashes; a 2- or 3-byte sequence is
+# one BMP character, hence one. Deterministic under any locale, and verified
+# byte-identical to the real regex run under node.
 session_dir_slug() {
     local path="$1"
     if command -v cygpath >/dev/null 2>&1; then
@@ -103,5 +143,30 @@ session_dir_slug() {
         path="${winpath:0:1}"
         path="${path,,}${winpath:1}"
     fi
-    echo "$path" | sed 's/[^a-zA-Z0-9]/-/g'
+    # The UTF-8 well-formedness table, one expression per row. Ranges matter:
+    # a lead byte does not accept every continuation. \355 (U+D800-DFFF, the
+    # surrogate block) and the overlong \340/\360 forms are not valid UTF-8,
+    # and the decoder emits one replacement character per byte for them — so
+    # they must fall through to the catch-all below rather than collapse here.
+    # Each lead also takes EXACTLY its own continuations: an unbounded run
+    # would swallow the lone continuation bytes after a valid sequence, which
+    # again are one replacement character each.
+    #
+    # Verified against the real regex under node over several hundred generated
+    # paths: identical for ALL well-formed UTF-8. The one shape that still
+    # differs is a TRUNCATED sequence (a valid lead and some of its
+    # continuations, then the string ends) — the decoder folds that into a
+    # single replacement character by the maximal-subpart rule, while this
+    # gives one dash per byte. Expressing that needs the decoder's state
+    # machine, and it cannot arise from a path a filesystem would hand us:
+    # macOS enforces well-formed UTF-8, Windows paths come from UTF-16. If it
+    # ever does, the slug misses and the hook now says so rather than sitting
+    # silent, which is the whole point of the warning below.
+    # A raw newline is a legal byte in a POSIX filename (only / and NUL are
+    # not) and is sed's own record separator, so it splits the input before any
+    # s/// rule sees it and would survive into the slug untouched — missing the
+    # directory exactly the way the locale bug did. Convert it here, where bash
+    # still has the string whole.
+    path=${path//$'\n'/-}
+    printf '%s\n' "$path" | LC_ALL=C sed "${_REMEMBER_SLUG_SED[@]}"
 }
