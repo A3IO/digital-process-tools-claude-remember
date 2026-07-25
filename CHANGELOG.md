@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The 0.8.6 fence fix could unclose a code block, and still orphaned a fence in `archive.md`** — post-release review of [#126](https://github.com/Digital-Process-Tools/claude-remember/issues/126) found the fix incomplete in both directions. It stripped a leading fence and then *any* trailing fence, so a summary whose last line closed a ```` ```bash ```` sample lost that terminator and the block never ended; a response that was simply a code block had its fences deleted outright. And when the model wrapped the **whole** response, the closing fence landed inside the archive section — which has no opening fence of its own, so the per-section strip could not see it and the orphan ``` still reached `archive.md`, the exact artifact originally reported. A fence is now only treated as a wrapper when the structure says so. The closer must use the same fence character with a run at least as long, and it must land on the last line at nesting depth zero — the body in between is walked tracking that depth, because a bare ``` opening an inner block is textually identical to a closer and anything less mistakes one for the other. When no closer arrives, what is left OPEN decides: a dangling fence that could have closed the wrapper (bare, same character, long enough) means the leading fence enclosed part of the content, while a dangling ```` ```bash ```` or ``~~~`` could never have closed it and so cannot keep the wrapper alive. The info string is evidence rather than a gate — ```` ```markdown ```` is taken at its word, any other tag has to earn it by closing cleanly around a body that reads as a section, which is also what separates a truncated wrap from a pasted log when the two are grammatically identical. A whole-response wrapper is stripped before the sections are split.
+
 ## [0.8.6] — Memory actually saves: agentic sessions, auth, channels, and an NDC data race
 
 ### Fixed

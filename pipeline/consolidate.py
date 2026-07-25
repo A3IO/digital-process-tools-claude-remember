@@ -31,36 +31,141 @@ from .types import ConsolidationResult, TokenUsage
 # A real memory entry header: "## HH:MM", "## Week of ...", or "## YYYY-MM-DD".
 _ENTRY_HEADER = re.compile(r"(?m)^## (\d{2}:\d{2}|Week of |\d{4}-\d{2}-\d{2})")
 
-# A Markdown code fence the model sometimes wraps a whole section body in:
-# an opening ``` (optionally ```markdown) line, and a matching closing ```.
-_OPEN_FENCE = re.compile(r"^```[^\n]*\n")
-_CLOSE_FENCE = re.compile(r"\n```$")
+# A fence opener: indent, a run of 3+ backticks or tildes, and an optional
+# info string. CommonMark matches a fence by CHARACTER and RUN LENGTH, which is
+# what lets a ````-wrapped body legally contain ``` blocks.
+_FENCE_OPENER = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+.-]*)\s*$")
+
+# Info strings a model uses when wrapping PROSE. Anything else (```bash,
+# ```python, ```json) opens a code sample that belongs to the content.
+_WRAP_TAGS = frozenset({"", "markdown", "md", "text", "txt", "plaintext"})
+
+
+def _looks_like_a_section(body: str) -> bool:
+    """Whether a body reads as consolidation output rather than pasted content.
+
+    Used only to break a tie the fence grammar cannot: see the last branch of
+    _strip_wrapping_fence. Deliberately narrow, and it must OPEN this way, not
+    merely contain it. An entry header like ``## 12:00`` is not enough because
+    a pasted log can carry one; and this runs once over the whole response,
+    where every genuine envelope contains ``===RECENT===`` somewhere — so
+    testing containment would make the tie always break the same way, which is
+    no tiebreaker at all.
+
+    The tie it cannot break: any fenced content whose first line merely STARTS
+    with one of these strings — a quoted excerpt of an older recent.md, but
+    equally a log headed ``# Recently Viewed`` — is read as a wrapper and loses
+    its fence. Prefix matching is deliberate (a section header carries a date
+    or title after it), and the cost is one fence line, never content. It is
+    rarer than the truncation it is traded against, so it is accepted rather
+    than patched around with a signal no more reliable than this one.
+
+    Args:
+        body: A body with its leading fence already removed.
+
+    Returns:
+        True if the body opens as a section or still carries its envelope.
+    """
+    return body.startswith(("# Recent", "# Archive", "===RECENT===", "===ARCHIVE==="))
 
 
 def _strip_wrapping_fence(text: str) -> str:
-    """Strip a Markdown code fence wrapping an entire section body.
+    """Strip a code fence wrapping an entire body, and nothing else.
 
-    Haiku occasionally returns the ``===RECENT===`` / ``===ARCHIVE===``
-    section body wrapped in a ```` ```markdown … ``` ```` fence, or emits a
-    stray leading ```` ``` ```` line. Left in place, that fence line defeats
-    the ``startswith("# Recent")`` check in parse_consolidation_response, so
-    a second ``# Recent`` header gets prepended — producing the
-    doubled-header + orphaned-fence artifact seen in recent.md (issue #126).
-    Strip the opening fence whenever present, and the closing fence only if
-    present (truncated model output can drop it), before the header check runs.
+    Haiku occasionally returns its output wrapped in a ```markdown ... ``` fence.
+    Left in place that fence defeats the ``startswith("# Recent")`` check in
+    parse_consolidation_response, so a second header gets prepended — the
+    doubled-header + orphaned-fence artifact of issue #126.
+
+    The hard part is recognising a wrapper, not removing one. Two earlier
+    attempts corrupted real content: stripping "a leading fence and any trailing
+    fence" cut the terminator off a ```bash sample, and counting fence-ish lines
+    for parity was defeated by any nested fence. So match fences the way
+    CommonMark does — by fence character and run length:
+
+    * an opener with no info string or a document-ish one (```markdown, ```txt)
+      is taken at its word. Any other tag still gets read — an allowlist of
+      five strings cannot anticipate ```yaml — but has to earn it by closing
+      cleanly around a body that reads as a section, which ```bash around a
+      code sample never does;
+    * the closer must use the same character with a run at least as long, which
+      is precisely what lets a ````-wrapped body contain ``` blocks untouched;
+    * it is only a wrapper if that closer is the LAST line, reached at nesting
+      depth zero. A bare ``` opening an inner block is textually identical to a
+      closer, so the body has to be walked with a fence stack rather than
+      scanned for the first match;
+    * otherwise what is left OPEN at the end of the body decides. A fence still
+      dangling there can be re-read as the leading fence's own closer — but
+      only if it could actually close it: bare, same character, run at least as
+      long. Then the leading fence enclosed part of the content, not all of it,
+      and the whole thing is left alone — unless the body reads as a section,
+      because a pasted log fenced at the top and a wrap truncated inside a bare
+      code block are the same shape and only the content separates them;
+    * anything else is a wrapper whose final fence never arrived — truncated
+      model output — so strip just the opener. Inner blocks that all closed are
+      no evidence the wrapper did, and a dangling ```bash or ~~~ could never
+      have closed it, so neither may keep the wrapper alive.
 
     Args:
-        text: A section body, before header normalization.
+        text: A body, before header normalization.
 
     Returns:
         The body with a wrapping code fence removed, stripped.
     """
     t = text.strip()
-    m = _OPEN_FENCE.match(t)
-    if m:
-        t = t[m.end():]
-        t = _CLOSE_FENCE.sub("", t)
-    return t.strip()
+    lines = t.split("\n")
+    opener = _FENCE_OPENER.match(lines[0])
+    if not opener:
+        return t
+
+    marker, info = opener.group(1), opener.group(2).lower()
+    documentish = info in _WRAP_TAGS
+
+    # A closer: same character, run at least as long, and no info string.
+    closer = re.compile(r"^\s*" + re.escape(marker[0]) + "{" + str(len(marker)) + r",}\s*$")
+    # Walk the body tracking nesting. An inner block opened with a bare ``` is
+    # textually identical to this wrapper's closer, so scanning for the first
+    # match read such an opener as closing mid-body and left the wrapper in
+    # place. Only a fence at depth zero, on the LAST line, closes the wrapper.
+    inner = None
+    for i in range(1, len(lines)):
+        fence = _FENCE_OPENER.match(lines[i])
+        if not fence:
+            continue
+        mark, tag = fence.group(1), fence.group(2)
+        # The last line is tested before the inner block gets to claim it, but
+        # only against a BARE inner opener — that one is itself ambiguous, and
+        # reading it as stray content beats leaving two fences in the output.
+        # A tagged ```bash block is unambiguous and keeps its terminator.
+        if i == len(lines) - 1 and closer.match(lines[i]) and not (inner and inner[1]):
+            wrapped = "\n".join(lines[1:i]).strip()
+            if documentish or _looks_like_a_section(wrapped):
+                return wrapped
+            return t
+        if inner is not None:
+            if not tag and mark[0] == inner[0][0] and len(mark) >= len(inner[0]):
+                inner = None
+            continue
+        inner = (mark, tag)
+
+    body = "\n".join(lines[1:]).strip()
+    # Nothing closed the wrapper on the last line. What is left over decides:
+    # a fence still open at the end of the body can be read as the leading
+    # fence's own closer, but only if it could actually close it — bare, same
+    # character, run at least as long. Anything else (everything balanced, or a
+    # dangling ```bash or ~~~ that could never close it) is a wrapper whose
+    # final fence never arrived, so only the opener goes.
+    if inner is not None and not inner[1] and closer.match(inner[0]):
+        # Grammar has run out: a pasted log fenced at the top of the body and a
+        # wrap truncated inside a bare code block are the same shape, one
+        # dangling fence with content after it. Only the content can tell them
+        # apart, and we know what the payload is supposed to look like.
+        if not _looks_like_a_section(body):
+            return t
+    elif not documentish and not _looks_like_a_section(body):
+        # ```bash opens a code sample. Only a section body argues otherwise.
+        return t
+    return body
 
 
 class ConsolidationSkipped(Exception):
@@ -201,6 +306,13 @@ def parse_consolidation_response(text: str) -> tuple[str, str]:
     """
     recent = ""
     archive = ""
+
+    # A wrap around the WHOLE response puts its closing fence at the very end,
+    # inside the archive section — which then has no opening fence of its own,
+    # so a per-section strip cannot see it and the orphan ``` lands in
+    # archive.md. That is the shape #126 was originally reported with, so the
+    # whole-response wrapper has to come off before the split (#154).
+    text = _strip_wrapping_fence(text)
 
     if "===RECENT===" in text and "===ARCHIVE===" in text:
         parts = text.split("===ARCHIVE===", 1)
