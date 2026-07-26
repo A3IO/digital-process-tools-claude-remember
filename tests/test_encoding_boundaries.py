@@ -25,10 +25,23 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+def _ambient_env() -> dict[str, str]:
+    """os.environ minus every GIT_* var.
+
+    conftest's _sanitize_ambient_git_env strips those per test, but the dicts
+    below are built at import time — before any fixture runs — so a GIT_DIR
+    leaked into the launching shell would be baked in and handed to every
+    subprocess these constants feed. Harmless while pipeline.shell never shells
+    out to git; a silent reopening of the bug the moment it does. Filter on the
+    prefix rather than restating conftest's list, so the two cannot drift.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 # A non-UTF-8 locale that survives PEP 538 C-locale coercion — makes Python's
 # stdin/subprocess codec ascii+surrogateescape on any OS, mimicking cp1252.
 FORCED_NON_UTF8_ENV = {
-    **os.environ,
+    **_ambient_env(),
     "PYTHONUTF8": "0",
     "PYTHONCOERCECLOCALE": "0",
     "LC_ALL": "C",
@@ -287,6 +300,62 @@ def test_consolidate_tolerates_non_utf8_staging(tmp_path, capsys):
     assert "RECENT_OUT=" in capsys.readouterr().out
 
 
+def test_consolidate_staging_consumed_bytes_match_real_file_size(tmp_path, capsys):
+    """The consumed-byte count recorded for run-consolidation.sh must describe
+    the FILE on disk, not the decoded-and-re-encoded string (review of 8d2cdab).
+
+    The staging file used to be read with ``open(..., errors="replace")`` and
+    the consumed count taken from ``len(content.encode("utf-8"))``. Each
+    undecodable byte becomes one U+FFFD, which re-encodes to three bytes, so a
+    file with two stray non-UTF-8 bytes measured four bytes bigger than it
+    actually is (a 61-byte file measured 65). Overstated, run-consolidation.sh's
+    ``staging_now -gt staging_consumed`` reads false and it falls through to the
+    blind ``mv`` rename — sealing anything appended during consolidation inside
+    ``.done.md``, unreachable, which is exactly the loss this count exists to
+    prevent (#142's shape, one layer over).
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    from unittest.mock import patch
+    from pipeline.shell import cmd_consolidate
+    from pipeline.types import ConsolidationResult, TokenUsage
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    staging_file = staging / "today-2020-01-01.md"
+    # \xff\xfe: two bytes, neither valid UTF-8 on its own. errors="replace"
+    # turns them into two U+FFFD (6 bytes when re-encoded) instead of 2.
+    raw_bytes = b"entry with two stray bytes \xff\xfe right here, then more text\n"
+    staging_file.write_bytes(raw_bytes)
+    real_size = os.path.getsize(staging_file)
+
+    res = ConsolidationResult(
+        recent="r", archive="a", tokens=TokenUsage(input=1, output=1, cache=0, cost_usd=0.0))
+    with patch("pipeline.consolidate.consolidate", return_value=res):
+        cmd_consolidate(
+            staging_dir=str(staging),
+            recent_file=str(tmp_path / "r.md"),
+            archive_file=str(tmp_path / "a.md"),
+        )
+    output = capsys.readouterr().out
+    staging_paths_file = next(
+        line.split("=", 1)[1]
+        for line in output.splitlines()
+        if line.startswith("STAGING_PATHS_FILE=")
+    )
+    raw = Path(staging_paths_file).read_bytes()
+    fields = [p for p in raw.split(b"\x00") if p]
+    paths_from_file, counts = fields[0::2], fields[1::2]
+    idx = next(i for i, p in enumerate(paths_from_file)
+               if p.decode().endswith("today-2020-01-01.md"))
+    consumed = int(counts[idx].decode())
+    assert consumed == real_size, (
+        f"consumed count {consumed} != real file size {real_size} bytes — "
+        "measured from the decoded-and-re-encoded string instead of the file, "
+        "so run-consolidation.sh's staging_now > staging_consumed check goes "
+        "false and seals appended entries inside .done.md"
+    )
+
+
 # ── Boundary 3: shell.py's own stdout, read back as a path by bash (#145)
 #
 # Every cmd_* prints KEY=value lines that bash captures by command substitution
@@ -301,7 +370,7 @@ def test_consolidate_tolerates_non_utf8_staging(tmp_path, capsys):
 # what Windows does: there the filesystem is UTF-8 (PEP 529) and only the
 # console codec is wrong. So keep the locale alone and force just the io codec
 # to a real ANSI codepage, which is exactly the shape #145 reported.
-ANSI_STDOUT_ENV = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+ANSI_STDOUT_ENV = {**_ambient_env(), "PYTHONIOENCODING": "cp1252"}
 ANSI_STDOUT_ENV.pop("PYTHONUTF8", None)
 
 
