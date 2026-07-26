@@ -17,6 +17,9 @@
     "ndc_compression": true,
     "recovery": true
   },
+  "git_backup": {
+    "allow_remote_change": false
+  },
   "debug": false,
   "time_format": "24h",
   "model": "haiku",
@@ -44,6 +47,20 @@
       "'none' -> gate disabled (only the literal SKIP contract applies).",
       "anything else -> a custom case-insensitive regex; invalid falls back to",
       "the default. An explicit REMEMBER_REJECT_PATTERN env var overrides this."
+    ],
+    "git_backup.allow_remote_change": [
+      "Guard against a swapped push remote. The backup hook records the remote",
+      "URL on the first push and aborts any later push whose URL differs — a",
+      "changed URL can mean a poisoned config.json pointing at an attacker's",
+      "host. false (default) keeps the guard on.",
+      "",
+      "Set true only to deliberately re-point at a new repo; the next push",
+      "records the new URL, so set it back to false afterwards.",
+      "",
+      "Note: before the jq-free config fallback landed, machines without jq",
+      "always read this as false regardless of configuration. It is now honoured",
+      "there too, so an existing true in your config takes effect on those",
+      "machines for the first time."
     ],
     "data_dir": [
       "Controls where memory data files are stored.",
