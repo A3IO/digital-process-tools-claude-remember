@@ -60,7 +60,50 @@ _remember_build_slug_sed
 # with enough lines would have been summarized into memory as if it were the
 # live session.
 claude_projects_dir() {
-    printf '%s/projects' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    local _root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+    # CLAUDE_CONFIG_DIR is inherited from the environment, so on Windows it
+    # arrives in whatever form the user typed — usually the native
+    # `C:\Users\x\.claude-alt`. Concatenating "/projects" onto that produced a
+    # mixed-separator path, while PROJECT_DIR gets converted deliberately
+    # before it is slugged. MSYS translates both forms in syscalls, so this may
+    # never have failed — but "probably fine" is what the last four
+    # session-directory bugs were, and each one surfaced as memory that simply
+    # stopped saving (#144, #166, #157, #169). One conversion costs nothing.
+    if command -v cygpath >/dev/null 2>&1; then
+        local _converted
+        _converted=$(cygpath -u "$_root" 2>/dev/null) && [ -n "$_converted" ] \
+            && _root="$_converted"
+    fi
+
+    # A trailing separator would give "…//projects", which is harmless on POSIX
+    # and not always harmless elsewhere. Strip both kinds; the loop matters
+    # because a path can end in more than one.
+    #
+    # With a floor: a value that is nothing BUT separators would otherwise strip
+    # to the empty string and turn "/projects" into a path at the filesystem
+    # root. `\` alone is a relative path, and silently promoting it to an
+    # absolute one is the kind of quiet reinterpretation every bug in this file
+    # has been. Nothing left to keep means keep what we were given.
+    local _stripped="$_root"
+    while [ "${_stripped%[/\\]}" != "$_stripped" ]; do
+        _stripped="${_stripped%[/\\]}"
+    done
+    if [ -n "$_stripped" ]; then
+        _root="$_stripped"
+    else
+        case "$_root" in
+            # "/" or "///" — the filesystem root, and "/projects" is what that
+            # means. Empty is the right value to append to.
+            /*) _root="" ;;
+            # "\" alone is a RELATIVE path. Stripping it to nothing would turn
+            # it into an absolute one, quietly pointing somewhere else entirely,
+            # so it stays exactly as it arrived.
+            *) ;;
+        esac
+    fi
+
+    printf '%s/projects' "$_root"
 }
 
 # Non-ASCII: Claude Code slugs with `s.replace(/[^a-zA-Z0-9]/g, '-')` — checked
