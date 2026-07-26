@@ -150,6 +150,14 @@ for MFILE in "$IDENTITY_FILE" "$CORE_MEMORIES" "$REMEMBER_TODAY_FILE" "$REMEMBER
         HAS_MEMORY="true"
     fi
 done
+# Rotated slices are memory too. A store can hold nothing but them — rotate an
+# oversized archive and the fresh archive.md stays empty until the next
+# consolidation — and gating on the list above meant the whole section was
+# skipped, so the one state issue #124 is written to fix printed nothing at all.
+ROTATED_ARCHIVES=$(ls "$REMEMBER_DIR"/archive-*.md 2>/dev/null | sort)
+if [ -n "$ROTATED_ARCHIVES" ]; then
+    HAS_MEMORY="true"
+fi
 
 if [ -n "$HAS_MEMORY" ]; then
     echo "=== MEMORY ==="
@@ -161,6 +169,65 @@ if [ -n "$HAS_MEMORY" ]; then
             echo ""
         fi
     done
+    # ── Rotated archives: named, not injected (#124) ──────────────────────
+    # An oversized archive.md is rotated to archive-YYYY-MM-DD.md and a fresh
+    # one started (#123). The bytes are kept, but nothing in the read path
+    # ever named them, so that slice of memory sat in cold storage no recall
+    # reached — "no memory lost" was true mechanically and false in practice.
+    #
+    # Named rather than cat'd on purpose: these files were rotated BECAUSE
+    # they were too large to fit a prompt, so injecting them would rebuild
+    # the problem rotation exists to solve. The agent greps them when a
+    # question reaches past what is in context.
+    if [ -n "$ROTATED_ARCHIVES" ]; then
+        # Newest ROTATED_LIST_MAX by date, because rotations accumulate for the
+        # life of a store and this prints on every single session start. The
+        # glob is given for the rest so nothing becomes unreachable again —
+        # which was the whole point of naming them.
+        ROTATED_LIST_MAX=10
+        ROTATED_COUNT=$(echo "$ROTATED_ARCHIVES" | wc -l | tr -d ' ')
+        # Order by the date and rotation number IN THE NAME, parsed — not by
+        # raw name, and not by mtime.
+        #
+        # Raw name is wrong because a second rotation the same day is
+        # archive-DATE-2.md, and '-' (0x2D) sorts before '.' (0x2E), so the
+        # later sibling sorts ahead of the base file it followed.
+        #
+        # mtime looked like the fix and is worse: git checkout writes files in
+        # byte-lexicographic order, so cloning the git-backed store (which
+        # hooks.d/after_save/50-git-backup.sh exists to make possible) hands
+        # archive-DATE-2.md an EARLIER mtime than archive-DATE.md. That
+        # reintroduces the same inversion on every restore, for every file,
+        # instead of only inside a same-day cluster.
+        #
+        # The name carries the truth: the date, then the rotation number, with
+        # the un-suffixed file being that day's first. Zero-padding the number
+        # makes the composed key sort correctly as plain text.
+        ROTATED_NEWEST=$(echo "$ROTATED_ARCHIVES" | while read -r _archive; do
+            [ -n "$_archive" ] || continue
+            _core=${_archive##*/}
+            _core=${_core#archive-}
+            _core=${_core%.md}
+            # Leading '(' on each pattern: bash 3.2 (still what macOS ships)
+            # miscounts the parens of a case inside $( ) without it.
+            case "$_core" in
+                (*-*-*-*) _date=${_core%-*}; _seq=${_core##*-} ;;
+                (*)       _date=$_core;      _seq=1 ;;
+            esac
+            case "$_seq" in (''|*[!0-9]*) _seq=1 ;; esac
+            printf '%s-%010d\t%s\n' "$_date" "$_seq" "$_archive"
+        done | sort | tail -n "$ROTATED_LIST_MAX" | cut -f2-)
+        echo "--- rotated archives (not shown; grep on request) ---"
+        echo "$ROTATED_NEWEST" | while read -r _archive; do
+            [ -f "$_archive" ] || continue
+            printf '%s (%s bytes)\n' "$_archive" "$(wc -c < "$_archive" | tr -d ' ')"
+        done
+        if [ "$ROTATED_COUNT" -gt "$ROTATED_LIST_MAX" ]; then
+            printf '... and %s older: %s/archive-*.md\n' \
+                "$((ROTATED_COUNT - ROTATED_LIST_MAX))" "$REMEMBER_DIR"
+        fi
+        echo ""
+    fi
     echo ""
 fi
 
