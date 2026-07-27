@@ -99,6 +99,54 @@ if [ -d "$SESSIONS_DIR" ] && [ -f "$LAST_SAVE_FILE" ]; then
 fi
 fi
 
+# ── Capture-gap detection (#200) ──────────────────────────────────────────
+# Claude Code reads hook registrations at session start, so a plugin enabled
+# MID-session has none of its hooks wired for that session: PostToolUse never
+# fires and capture silently does nothing, for hours, with nothing in the logs
+# to say so. The reporter lost a day to it and found only a lone session-start
+# line.
+#
+# It cannot be caught while it is happening. Nothing inside a hook can see
+# which hooks are registered — no env var, no file, and `/hooks` is a UI a
+# script cannot invoke — and SessionStart's `source` field is only
+# startup/resume/clear/compact/fork, so a plugin-enable is indistinguishable
+# from a fresh start. Afterwards, though, the signature is exact: a session
+# where SessionStart ran and PostToolUse never did.
+#
+# Judged by IDENTITY: post-tool-hook.sh writes the session id it saw into
+# capture-alive, and if that is not the previous session's id then PostToolUse
+# never ran for it. Comparing mtimes instead failed — bash 3.2's `-nt` works to
+# the second, so a healthy session whose first tool call landed inside the same
+# second as a stamp was reported as broken.
+#
+# Deliberately NOT gated on "have we run before". A first cut required a prior
+# session-start stamp, to keep a fresh install from being greeted with a
+# warning — which sounds right and defeats the entire purpose: during a
+# mid-session enable NO hook runs, so no stamp is written, so the one incident
+# this exists to report was the exact case it stayed silent for. It could only
+# ever have caught a recurrence.
+#
+# So the question is just "was the previous session captured", and the answer
+# is reported whether or not this plugin has run before. A fresh install does
+# see it once per project, which is honest: memory really does start here, and
+# the wording says so.
+CAPTURE_ALIVE="$REMEMBER_DIR/tmp/capture-alive"
+
+# The second-newest transcript is the previous session — the same convention
+# the recovery block above uses. Guard against the honest zero-tool session
+# too: a conversation with no tool calls produces no PostToolUse either, and
+# warning about that would be crying wolf.
+PREV_SLUG="$(session_dir_slug "$PROJECT")"
+PREV_JSONL=$(ls -t "$(claude_projects_dir)/${PREV_SLUG}"/*.jsonl 2>/dev/null | tail -n +2 | head -1)
+PREV_ID=""
+[ -n "$PREV_JSONL" ] && PREV_ID=$(basename "$PREV_JSONL" .jsonl)
+SEEN_ID=$(cat "$CAPTURE_ALIVE" 2>/dev/null) || true
+if [ -n "$PREV_ID" ] && [ "$SEEN_ID" != "$PREV_ID" ] \
+   && grep -q '"tool_use"' "$PREV_JSONL" 2>/dev/null; then
+    echo "remember: your previous session was not captured. If you just installed or enabled the plugin, that is expected — capture starts now. Otherwise its hooks were not registered for that session; run /remember:doctor." \
+        > "$REMEMBER_DIR/tmp/capture-gap-notice" 2>/dev/null || true
+fi
+
 # ── Identity: per-project → user-global → plugin-bundled ──────────────────
 # User-global tier: <REMEMBER_ROOT>/identity.md (external mode only).
 # In legacy mode REMEMBER_ROOT == PROJECT_DIR, so we skip it there.
