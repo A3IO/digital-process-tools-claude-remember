@@ -9,7 +9,8 @@ The CLI is invoked in a sandboxed configuration: ``cwd=tempdir``, no tools
 by default, ``max-turns`` configurable via ``REMEMBER_MAX_TURNS`` (default 4),
 and the parent Claude Code session env vars are stripped (``CLAUDECODE`` to
 allow a nested session; ``CLAUDE_JOB_DIR`` / ``CLAUDE_CODE_*`` so the child
-doesn't masquerade as the parent's session, #95).
+doesn't masquerade as the parent's session, #95), and ``REMEMBER_NESTED_SUMMARIZER``
+is set so the plugin's own hooks recognise the child and no-op (#204).
 
 Module-level constants:
     HAIKU_INPUT_PRICE: USD cost per input token.
@@ -101,6 +102,10 @@ def _resolve_claude_bin() -> str:
 # `claude setup-token` or runs under a hosted Agent SDK (#131). Keep it.
 _CHILD_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
 
+# Set on the child, read by scripts/resolve-paths.sh (#204). Shared here as a
+# constant so the tests pin one spelling against both sides of the contract.
+NESTED_SUMMARIZER_ENV = "REMEMBER_NESTED_SUMMARIZER"
+
 
 def _child_env() -> dict[str, str]:
     """Environment for the nested ``claude -p`` with the PARENT session vars
@@ -112,8 +117,17 @@ def _child_env() -> dict[str, str]:
     a resumable session to anything keying off them (#95). Everything else is
     passed through unchanged — including the credentials in ``_CHILD_ENV_KEEP``,
     which only share the prefix by accident.
+
+    ``REMEMBER_NESTED_SUMMARIZER`` is then set as the positive counterpart to
+    that stripping. Removing the parent markers is what lets the child start at
+    all, and it also erases every trace that it IS a child — so the plugin's own
+    hooks fire inside it, resolve a project from ``cwd=gettempdir()``, and
+    scaffold a memory directory for the temp dir (#204). The hooks were always
+    meant to no-op here; they were reading a signal this function had deleted.
+    A marker we set ourselves cannot be deleted by us and cannot false-positive
+    on an unrelated session, which ``CLAUDE_CODE_ENTRYPOINT=sdk-cli`` would.
     """
-    return {
+    env = {
         k: v
         for k, v in os.environ.items()
         if k in _CHILD_ENV_KEEP
@@ -123,6 +137,62 @@ def _child_env() -> dict[str, str]:
             and not k.startswith("CLAUDE_CODE_")
         )
     }
+    env[NESTED_SUMMARIZER_ENV] = "1"
+    return env
+
+
+def _usage_from_failure(stdout: object) -> TokenUsage | None:
+    """Token counts out of a FAILED call's output, when it carried any.
+
+    ``--output-format json`` makes the CLI report errors as a JSON object on
+    stdout (that is what #129 was about), and that object can carry the same
+    usage block a success does. A timeout usually leaves nothing parseable —
+    the process was killed mid-write — so this returns None more often than not.
+    """
+    if isinstance(stdout, bytes):
+        try:
+            stdout = stdout.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+    try:
+        payload = json.loads(stdout)
+    except ValueError:
+        return None
+    if isinstance(payload, list):
+        payload = payload[-1] if payload else {}
+    if not isinstance(payload, dict):
+        return None
+    usage = _extract_tokens(payload)
+    # An all-zero reading means the payload had no usage block at all, which is
+    # not the same as a call that cost nothing — say unknown rather than free.
+    if usage.input or usage.output or usage.cache:
+        return usage
+    return None
+
+
+def _log_failed_spend(what_happened: str, stdout: object) -> None:
+    """Record what a call that FAILED cost (#190).
+
+    Every accounting path in the pipeline hangs off a returned result, and a
+    failure returns none — so a run where the model times out repeatedly showed
+    errors in the log and zero reported cost, which reads as "it failed for
+    free". It did not: a client-side timeout aborts a call the API has already
+    been billing, and a mid-stream error has already consumed input.
+
+    "unknown" is the honest answer when the payload carries no usage. Zero is
+    not.
+    """
+    usage = _usage_from_failure(stdout)
+    if usage is not None:
+        _warn(f"call {what_happened} after spending tokens: {usage}")
+    else:
+        _warn(
+            f"call {what_happened}; tokens already spent are unknown — the "
+            "failure carried no usage block, so this run's reported cost is "
+            "lower than what it actually cost"
+        )
 
 
 # Cap on the failure detail carried into the exception: enough to identify an
@@ -380,10 +450,14 @@ def call_haiku(
             env=env,
             cwd=tempfile.gettempdir(),
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as timed_out:
+        # A client-side timeout aborts a call the API has already been billing.
+        # Whatever partial output arrived is the only evidence of what it cost.
+        _log_failed_spend(f"timed out after {timeout}s", timed_out.stdout)
         raise RuntimeError(f"claude timed out after {timeout}s")
 
     if result.returncode != 0:
+        _log_failed_spend(f"exited {result.returncode}", result.stdout)
         raise RuntimeError(
             f"claude exited {result.returncode}: "
             f"{_failure_detail(result.stdout, result.stderr)}"

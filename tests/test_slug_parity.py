@@ -14,6 +14,7 @@ against each other.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -230,6 +231,132 @@ def test_the_long_path_hash_survives_without_python():
         "wrong in exactly the way it was before, not a crash and not a "
         "truncation with no hash on the end, which would match nothing at all"
     )
+
+
+# Ill-formed UTF-8: legal on Linux, where filenames are bytes. The real decoder
+# folds each ill-formed sequence into ONE replacement character by the
+# maximal-subpart rule; the sed byte table gives one dash per byte, which is the
+# divergence #186 was opened for.
+MALFORMED = [
+    b"ab\xe0\xa0cd",          # 3-byte lead, one continuation, then ASCII
+    b"x\xf0\x90y",            # 4-byte lead truncated mid-sequence
+    b"/tmp/\xff\xfe/x",       # bytes that begin nothing at all
+    b"/tmp/caf\xe9",          # Latin-1 "café" — the classic legacy filename
+]
+
+
+@pytest.mark.parametrize("raw", MALFORMED)
+def test_malformed_utf8_matches_the_decoder(raw):
+    """#186: the shell delegates these to the decoder rather than guessing.
+
+    `errors="replace"` is Python's implementation of the same maximal-subpart
+    rule the platform decoder uses, so it stands in for the oracle here.
+    """
+    decoded = raw.decode("utf-8", "replace")
+    expected = js_slug(decoded)
+
+    script = f"""
+    PIPELINE_DIR="{REPO_ROOT}"
+    REMEMBER_UTF8_STRICT=1
+    source "{LIB_SLUG_SH}"
+    session_dir_slug "$1"
+    """
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", raw.decode("utf-8", "surrogateescape")],
+        capture_output=True, text=True, errors="replace",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.rstrip("\n") == expected, (
+        f"{raw!r}: shell gave {result.stdout.rstrip()!r}, the decoder says "
+        f"{expected!r} — one dash per bad byte instead of one per ill-formed "
+        "sequence"
+    )
+
+
+def _forks_while_slugging(path: str, tmp_path: Path, *, strict: bool,
+                          locale: str | None = None) -> set[str]:
+    """Which of `iconv` / `python3` a slug of `path` actually spawns.
+
+    Both are shadowed by markers on PATH, so this counts real forks rather than
+    the one the test author happened to think of — the first version of this
+    watched only for Python and would have passed while `iconv` forked on every
+    non-ASCII path.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name in ("iconv", "python3"):
+        marker = tmp_path / f"{name}-was-called"
+        if marker.exists():
+            marker.unlink()
+        # Record AND delegate to the real binary. A stub that merely fails
+        # changes the behaviour it is measuring: an `iconv` that always exits 1
+        # makes every path look ill-formed, which is how the first version of
+        # this helper "found" a well-formed path reaching the decoder.
+        real = shutil.which(name)
+        stub = bindir / name
+        stub.write_text(
+            f"#!/usr/bin/env bash\ntouch '{marker}'\nexec '{real}' \"$@\"\n"
+            if real else f"#!/usr/bin/env bash\ntouch '{marker}'\nexit 127\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+    env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    env["PIPELINE_DIR"] = str(REPO_ROOT)
+    env["REMEMBER_UTF8_STRICT"] = "1" if strict else "0"
+    if locale is not None:
+        env["LC_ALL"] = locale
+    subprocess.run(
+        ["bash", "-c",
+         f'source "{LIB_SLUG_SH}"; session_dir_slug "$1" >/dev/null', "bash", path],
+        env=env, capture_output=True, text=True,
+    )
+    return {n for n in ("iconv", "python3") if (tmp_path / f"{n}-was-called").exists()}
+
+
+def test_an_ascii_path_forks_nothing(tmp_path):
+    """session_dir_slug runs on every tool call. The common path must stay in
+    the byte table even where the check is enabled."""
+    assert _forks_while_slugging("/tmp/plain-ascii", tmp_path, strict=True) == set()
+
+
+@pytest.mark.parametrize("locale", ["C", "POSIX", "en_US.UTF-8", "C.UTF-8"])
+def test_an_ascii_path_forks_nothing_in_any_locale(locale, tmp_path):
+    """An ASCII path must never fork, whatever the locale.
+
+    This is defense-in-depth, not a reproduction. The real failure happened on
+    the macOS CI runners — three runs red, and green the moment the detection
+    was forced to byte semantics with LC_ALL=C — but a sweep of every locale
+    installed on the development machine could not reproduce it under bash
+    3.2, so the mechanism is unconfirmed and these four locales are not known
+    to be the ones that differ.
+
+    Kept because the invariant is worth stating and cheap to check, and
+    because CI is where it actually bites. Do not read a pass here as proof
+    the underlying bug is gone.
+    """
+    assert _forks_while_slugging(
+        "/tmp/plain-ascii", tmp_path, strict=True, locale=locale
+    ) == set()
+
+
+def test_a_valid_non_ascii_path_pays_at_most_the_check(tmp_path):
+    """Accented and CJK paths are ordinary. They may reach `iconv`, which says
+    they are well-formed — but they must never reach the decoder."""
+    forked = _forks_while_slugging("/tmp/café/日本語/🎉", tmp_path, strict=True)
+    assert "python3" not in forked, (
+        "a well-formed path was handed to the decoder — that is a subprocess "
+        "per tool call bought for nothing"
+    )
+
+
+def test_nothing_forks_at_all_where_the_bug_cannot_happen(tmp_path):
+    """macOS enforces well-formed UTF-8 and Windows paths come from UTF-16, so
+    neither can produce the input this handles and neither should pay ~6ms per
+    tool call to find that out."""
+    if sys.platform.startswith("linux"):
+        pytest.skip("Linux is where the check is meant to run")
+    assert _forks_while_slugging("/tmp/café/日本語/🎉", tmp_path, strict=False) == set()
 
 
 def test_a_hash_that_is_not_base36_is_refused(tmp_path):

@@ -126,6 +126,37 @@ claude_projects_dir() {
 # sequence is one surrogate pair, hence two dashes; a 2- or 3-byte sequence is
 # one BMP character, hence one. Deterministic under any locale, and verified
 # byte-identical to the real regex run under node.
+# Should this path be checked for ill-formed UTF-8 (#186)?
+#
+# Only where such a path can exist. macOS enforces well-formed UTF-8 in
+# filenames and Windows paths come from UTF-16; Linux enforces nothing, so it is
+# the only platform that can hand us one. $OSTYPE is a bash variable, not a
+# fork, and that matters. Measured with scripts/bench-slug.sh (macOS, bash 3.2,
+# 200 calls each) — absolute numbers are machine-specific and subprocess-spawn
+# dominated; the ratios are the point:
+#
+#   platform      ASCII    valid non-ASCII    ill-formed
+#   non-Linux     2.1ms    2.1ms              2.2ms        (never checked)
+#   Linux         2.0ms    8.7ms              71ms         (iconv, then python)
+#
+# So an ASCII path pays nothing anywhere, a macOS or Windows user pays nothing
+# at all, and the ~6.5ms belongs only to a Linux user with a non-ASCII path —
+# where the bug is actually reachable. The 71ms case is a path that is already
+# broken and would otherwise have saved nothing at all.
+#
+# REMEMBER_UTF8_STRICT=1 forces it on anyway. Without that the behaviour would
+# be untestable everywhere except a Linux runner, and a fix nobody can exercise
+# locally is a fix nobody maintains.
+_remember_should_check_utf8() {
+    [ "${REMEMBER_UTF8_STRICT:-0}" = "1" ] && return 0
+    # ${OSTYPE:-}: bash always sets it, but this file is sourced by callers
+    # running under `set -u`, and one unguarded expansion there aborts the hook.
+    case "${OSTYPE:-}" in
+        linux*) return 0 ;;
+    esac
+    return 1
+}
+
 session_dir_slug() {
     local path="$1"
     if command -v cygpath >/dev/null 2>&1; then
@@ -164,6 +195,77 @@ session_dir_slug() {
     # directory exactly the way the locale bug did. Convert it here, where bash
     # still has the string whole.
     local _orig="$path"
+
+    # The byte table below is exact for well-formed UTF-8 and only for that. A
+    # lead byte missing its continuations gets one dash per byte here, where the
+    # real decoder folds it into a single replacement character by the
+    # maximal-subpart rule. macOS enforces well-formed UTF-8 and Windows paths
+    # come from UTF-16, but Linux enforces nothing — every byte except / and NUL
+    # is a legal filename, so a legacy-encoded or corrupted directory name gets
+    # here (#186).
+    #
+    # Expressing maximal-subpart needs the decoder's state machine, which sed
+    # does not have and Python does. So: ask Python, but only for a path that is
+    # both non-ASCII AND actually malformed. An all-ASCII path — the overwhelming
+    # majority, and this function runs on every tool call — never even reaches
+    # the `iconv` check, let alone the subprocess.
+    if _remember_should_check_utf8; then
+    # Any byte at or above 0x80 — anything that could be part of a multi-byte
+    # sequence. The earlier form (`[!$' \t'-~]`) also caught DEL and the C0
+    # controls, which are always valid single-byte ASCII and could never be what
+    # this looks for; they paid for a check that can only answer yes.
+    #
+    # The range starts at \001, not \000, and that is not a style choice: bash
+    # cannot hold a NUL in a string, so $'\000' expands to NOTHING and the
+    # bracket degenerates into `[!-\177]` — "any character except - and DEL" —
+    # which matches essentially every path. The tightest-looking form of this
+    # test is the loosest one, and it costs a fork per tool call. A NUL cannot
+    # appear in an argv string anyway, so starting at \001 loses nothing.
+    # Detect under LC_ALL=C, then act.
+    #
+    # What is established: on the macOS CI runners this same expression matched
+    # plain ASCII paths and forked `iconv` on every one, while answering
+    # correctly on a local macOS box. Three consecutive runs failed
+    # (30235721355, 30236170724, 30237326112) and the run that added LC_ALL=C
+    # passed (30237861167), all on the same test.
+    #
+    # What is NOT established is the mechanism. The obvious candidate is that a
+    # bracket RANGE is matched by collation order rather than byte value — the
+    # same trap this file already documents for `[a-z]` in the sed program
+    # below — but a sweep of all 55 installed locales under bash 3.2 failed to
+    # reproduce it, so the runner must differ in bash build or locale data in
+    # some way not identified. Forcing byte semantics fixes it either way and
+    # costs nothing; the honest label is "empirically necessary, mechanism
+    # unconfirmed".
+    #
+    # The result is stashed in a flag rather than acted on inside the `case`,
+    # because the branch below can return early and would leave the caller's
+    # locale changed.
+    local _high_byte=0 _lc_was_set="${LC_ALL+set}" _lc_prev="${LC_ALL:-}"
+    LC_ALL=C
+    case "$path" in
+        *[!$'\001'-$'\177']*) _high_byte=1 ;;
+    esac
+    if [ -n "$_lc_was_set" ]; then LC_ALL="$_lc_prev"; else unset LC_ALL; fi
+
+    case "$_high_byte" in
+        1)
+            if command -v iconv >/dev/null 2>&1 \
+                && ! printf '%s' "$path" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+                local _py_slug="${PIPELINE_DIR:-}/pipeline/slug.py"
+                if [ -f "$_py_slug" ]; then
+                    local _decoded
+                    _decoded=$("${PYTHON:-python3}" "$_py_slug" "$path" 2>/dev/null) \
+                        && [ -n "$_decoded" ] && { printf '%s\n' "$_decoded"; return 0; }
+                fi
+                # No Python to ask: fall through to the byte table, which is
+                # wrong for this input in a known and documented way rather than
+                # failing.
+            fi
+            ;;
+    esac
+    fi
+
     path=${path//$'\n'/-}
     local _slug
     _slug=$(printf '%s\n' "$path" | LC_ALL=C sed "${_REMEMBER_SLUG_SED[@]}")
