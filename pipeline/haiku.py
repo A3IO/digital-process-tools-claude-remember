@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from .types import HaikuResult, TokenUsage
@@ -93,6 +94,14 @@ def _resolve_claude_bin() -> str:
     return shutil.which("claude") or "claude"
 
 
+# CLAUDE_CODE_* vars are stripped as parent-session identity (#95) — but the
+# prefix is a proxy, not a definition, and one member of the family is the
+# child's *credentials*. Stripping CLAUDE_CODE_OAUTH_TOKEN leaves `claude -p`
+# unauthenticated, so nothing ever saves for anyone who authenticated with
+# `claude setup-token` or runs under a hosted Agent SDK (#131). Keep it.
+_CHILD_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+
+
 def _child_env() -> dict[str, str]:
     """Environment for the nested ``claude -p`` with the PARENT session vars
     stripped.
@@ -101,15 +110,215 @@ def _child_env() -> dict[str, str]:
     ``CLAUDE_CODE_*`` family (e.g. ``CLAUDE_CODE_SESSION_ID``) identify the
     parent Claude Code session; if they leak into the subprocess it looks like
     a resumable session to anything keying off them (#95). Everything else is
-    passed through unchanged.
+    passed through unchanged — including the credentials in ``_CHILD_ENV_KEEP``,
+    which only share the prefix by accident.
     """
     return {
         k: v
         for k, v in os.environ.items()
-        if k != "CLAUDECODE"
-        and k != "CLAUDE_JOB_DIR"
-        and not k.startswith("CLAUDE_CODE_")
+        if k in _CHILD_ENV_KEEP
+        or (
+            k != "CLAUDECODE"
+            and k != "CLAUDE_JOB_DIR"
+            and not k.startswith("CLAUDE_CODE_")
+        )
     }
+
+
+# Cap on the failure detail carried into the exception: enough to identify an
+# auth error or a rate limit, not enough to dump a whole JSON payload into the
+# log on every failure.
+_FAILURE_DETAIL_MAX = 500
+
+
+def _failure_detail(stdout: str, stderr: str) -> str:
+    """Best available explanation for a non-zero ``claude`` exit.
+
+    ``--output-format json`` makes the CLI report failures as a JSON object on
+    **stdout** and leave stderr empty, so reading stderr alone produced
+    ``claude exited 1:`` with nothing after the colon — which hid a 7-week auth
+    outage from the reporter of #129. Prefer the structured message on stdout,
+    fall back to raw stdout, then stderr, and say so explicitly when both are
+    empty rather than trailing off.
+    """
+    detail = ""
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except ValueError:
+            detail = stdout
+        else:
+            if isinstance(payload, dict):
+                for key in ("error", "result", "message"):
+                    value = payload.get(key)
+                    if isinstance(value, dict):
+                        value = value.get("message")
+                    if isinstance(value, str) and value.strip():
+                        detail = value.strip()
+                        break
+            detail = detail or stdout
+
+    parts = [p for p in (detail, stderr) if p]
+    if not parts:
+        return "(no output on stdout or stderr)"
+    joined = " | ".join(parts)
+    if len(joined) > _FAILURE_DETAIL_MAX:
+        joined = joined[:_FAILURE_DETAIL_MAX] + "…"
+    return joined
+
+
+# The nested `claude -p` needs its own credentials. Normally that is
+# CLAUDE_CODE_OAUTH_TOKEN, kept across the strip by _CHILD_ENV_KEEP (#131).
+# But some hosts never place it in a hook subprocess's environment at all — the
+# Claude Code desktop / Agent SDK host withholds it from spawned children — so
+# there is nothing to keep and `claude -p` is unauthenticated: the silent-save
+# outage of #129 on a machine that *did* run `claude setup-token`.
+#
+# Recovery is consent-based: the operator hands THIS plugin a token to pass to
+# the nested CLI, via the REMEMBER_OAUTH_TOKEN env var or a `haiku.oauth_token`
+# key in config.json. It is used only when the child env has no
+# CLAUDE_CODE_OAUTH_TOKEN, and only a value the operator deliberately
+# configured — nothing is read from OS credential storage the platform withheld.
+_MIN_TOKEN_LEN = 20
+
+
+def _warn(message: str) -> None:
+    """Surface a token-resolution problem where an operator will actually read it.
+
+    The daily log is the one place shell and pipeline entries interleave.
+    stderr is not: ``save-session.sh`` captures ``call-haiku``'s stderr to a
+    temp file and only echoes it when the call *fails*, so a warning written
+    there on the way to a successful call is discarded. Falls back to stderr
+    only when REMEMBER_DIR is unset (direct python use, tests).
+
+    Never raises — this sits on the path to authenticating, and a logging
+    failure must not become an auth failure.
+    """
+    try:
+        remember_dir = os.environ.get("REMEMBER_DIR", "").strip()
+        if remember_dir:
+            from .log import log
+
+            log("haiku", message, os.path.join(remember_dir, "logs"))
+        else:
+            print(f"[haiku] {message}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _looks_like_token(value: object) -> bool:
+    """A configured value is usable only if it is a non-empty, whitespace-free
+    string of plausible length.
+    """
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return len(stripped) >= _MIN_TOKEN_LEN and not any(c.isspace() for c in stripped)
+
+
+def _accept_token(value: object, source: str) -> str | None:
+    """The configured value if usable, else ``None`` **and a log line**.
+
+    A rejected value used to vanish in silence, which made a typo'd or
+    truncated token indistinguishable from never having configured one: the
+    nested CLI ran unauthenticated and the operator got the same confusing auth
+    error this fallback exists to prevent, now with a misleading origin.
+
+    An empty value stays silent — that is how the bundled config ships the key
+    (``"oauth_token": ""``), i.e. "not configured", and it reaches here on
+    every save through the merged config.
+
+    The value itself is never logged; only its source and its length.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not _looks_like_token(value):
+        if isinstance(value, str):
+            detail = f"{len(value.strip())} chars"
+        else:
+            detail = f"a {type(value).__name__} value"
+        _warn(
+            f"WARNING: ignoring {source} — not a plausible OAuth token "
+            f"(want a whitespace-free string of at least {_MIN_TOKEN_LEN} "
+            f"chars, got {detail}); the nested CLI will run unauthenticated "
+            "unless the host provides a token of its own"
+        )
+        return None
+    return str(value).strip()
+
+
+def _config_candidates() -> list[str]:
+    """Config files to search for ``haiku.oauth_token``, highest priority first.
+
+    ``REMEMBER_CONFIG`` is the merged config ``lib-memory-dir.sh`` builds from
+    all three layers (plugin-bundled, user-global, per-project) and exports
+    before invoking the pipeline — the repo's single source of truth for config
+    resolution. Reading it, rather than re-deriving the layer order here, is
+    what keeps this from becoming a second config reader free to drift from the
+    shell one (#177).
+
+    The raw paths stay as a fallback for direct python use (tests, a manual
+    ``python3 -m pipeline.shell`` call) where no shell wrapper ran.
+    """
+    candidates = []
+    merged = os.environ.get("REMEMBER_CONFIG", "").strip()
+    if merged:
+        candidates.append(merged)
+    remember_dir = os.environ.get("REMEMBER_DIR", "").strip()
+    if remember_dir:
+        candidates.append(os.path.join(remember_dir, "config.json"))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".remember", "config.json"))
+    return candidates
+
+
+def _configured_oauth_token() -> str | None:
+    """Operator-configured OAuth token for the nested CLI, or ``None``.
+
+    Precedence: the ``REMEMBER_OAUTH_TOKEN`` env var, then a
+    ``haiku.oauth_token`` key in the first config file that declares one (see
+    ``_config_candidates``). Best-effort: any missing file, read error, or
+    malformed JSON yields ``None`` and never raises — but a value that is
+    present and unusable is logged rather than dropped silently.
+    """
+    env_token = os.environ.get("REMEMBER_OAUTH_TOKEN", "").strip()
+    if env_token:
+        token = _accept_token(env_token, "REMEMBER_OAUTH_TOKEN")
+        if token:
+            return token
+
+    for path in _config_candidates():
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        haiku_cfg = cfg.get("haiku")
+        if not isinstance(haiku_cfg, dict) or "oauth_token" not in haiku_cfg:
+            continue
+        token = _accept_token(haiku_cfg["oauth_token"], f"haiku.oauth_token in {path}")
+        if token:
+            return token
+    return None
+
+
+def _inject_configured_oauth_token(env: dict[str, str]) -> dict[str, str]:
+    """Fill CLAUDE_CODE_OAUTH_TOKEN from operator config when the child env
+    lacks it (see the note above).
+
+    Never overrides a value already present — the host-provided credential wins.
+    Never raises: token resolution is entirely best-effort.
+    """
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return env
+    token = _configured_oauth_token()
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return env
 
 
 def call_haiku(
@@ -155,6 +364,7 @@ def call_haiku(
     ]
 
     env = _child_env()
+    env = _inject_configured_oauth_token(env)
 
     try:
         result = subprocess.run(
@@ -174,8 +384,10 @@ def call_haiku(
         raise RuntimeError(f"claude timed out after {timeout}s")
 
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise RuntimeError(f"claude exited {result.returncode}: {stderr}")
+        raise RuntimeError(
+            f"claude exited {result.returncode}: "
+            f"{_failure_detail(result.stdout, result.stderr)}"
+        )
 
     return _parse_response(result.stdout)
 
@@ -266,9 +478,11 @@ def _parse_response(raw: str) -> HaikuResult:
 
     # Drop SKIP (model found nothing worth saving) AND refusals/clarifications
     # (the reject-gate) so neither is ever written to the memory layer.
-    is_skip = text.strip().upper().startswith("SKIP") or _is_non_summary(text)
+    model_skipped = text.strip().upper().startswith("SKIP")
+    rejected = not model_skipped and _is_non_summary(text)
 
-    return HaikuResult(text=text, tokens=tokens, is_skip=is_skip)
+    return HaikuResult(text=text, tokens=tokens,
+                       is_skip=model_skipped or rejected, is_rejected=rejected)
 
 
 def _extract_tokens(data: dict) -> TokenUsage:

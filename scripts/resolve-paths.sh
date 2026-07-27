@@ -14,8 +14,23 @@
 #     3. Symlinked:   Any of the above with symlinks in the chain
 #
 # USAGE
-#   source "$(dirname "$0")/resolve-paths.sh"
+#   source "$(dirname "$0")/resolve-paths.sh" || exit <caller-appropriate-code>
 #   # Now PROJECT_DIR and PIPELINE_DIR are set and validated
+#
+#   This file is ALWAYS sourced, never executed directly. On failure it is
+#   LOUD BY DEFAULT: it prints FATAL and `exit 1`s the caller, because a caller
+#   that continues with unresolved paths writes memory to the wrong place —
+#   worse than a crash.
+#
+#   A caller that must never terminate its host process opts out by setting
+#   REMEMBER_PATHS_SOFT_FAIL=1 before sourcing; failure then `return 1`s and the
+#   caller decides. Only the three Claude Code hooks do this — they are
+#   documented "EXIT CODES: 0 Always" (a bare `exit` inside a sourced file kills
+#   the whole hook process, which crashes the nested Haiku session that runs
+#   with no resolvable project root). They pair it with `|| exit 0`.
+#
+#   The default is loud on purpose: a future caller that forgets to check the
+#   status still fails safely instead of silently continuing with empty paths.
 #
 # ENVIRONMENT (inputs)
 #   CLAUDE_PROJECT_DIR    Project root (set by Claude Code hooks)
@@ -25,8 +40,13 @@
 #   PROJECT_DIR           Resolved project root (validated to exist)
 #   PIPELINE_DIR          Resolved plugin root (validated to exist)
 #
-# EXIT CODES
-#   1   Path resolution failed (PROJECT_DIR or PIPELINE_DIR not found)
+# ENVIRONMENT (opt-in)
+#   REMEMBER_PATHS_SOFT_FAIL=1   Signal failure with `return 1` instead of
+#                                exiting the caller. Set by the hook scripts.
+#
+# RETURN CODES
+#   1   Path resolution failed, and the caller opted into soft failure.
+#       Without the opt-in, resolution failure exits the caller with 1.
 #
 # ============================================================================
 
@@ -47,6 +67,18 @@ umask 077
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _PLUGIN_ROOT_CANDIDATE="$(cd "$_SCRIPT_DIR/.." && pwd)"
 
+# _resolve_paths_fail <message> [log_dir]
+# Report a resolution failure, then apply the caller's failure policy: `return 1`
+# when REMEMBER_PATHS_SOFT_FAIL=1, otherwise exit the caller (the default).
+_resolve_paths_fail() {
+    echo "$1" >&2
+    if [ -n "${2:-}" ] && [ -d "$2" ]; then
+        echo "$(date '+%H:%M:%S') [resolve] $1" >> "$2/memory-$(date '+%Y-%m-%d').log" 2>/dev/null
+    fi
+    [ "${REMEMBER_PATHS_SOFT_FAIL:-0}" = "1" ] && return 1
+    exit 1
+}
+
 if [ -n "$CLAUDE_PLUGIN_ROOT" ]; then
     PIPELINE_DIR="$CLAUDE_PLUGIN_ROOT"
 elif [ -f "$_PLUGIN_ROOT_CANDIDATE/pipeline/haiku.py" ]; then
@@ -54,13 +86,7 @@ elif [ -f "$_PLUGIN_ROOT_CANDIDATE/pipeline/haiku.py" ]; then
     PIPELINE_DIR="$_PLUGIN_ROOT_CANDIDATE"
 else
     _msg="FATAL: Cannot resolve plugin root. CLAUDE_PLUGIN_ROOT is not set and $_PLUGIN_ROOT_CANDIDATE/pipeline/haiku.py does not exist."
-    echo "$_msg" >&2
-    # Try to log if we can find a log directory
-    _log_dir="${CLAUDE_PROJECT_DIR:-.}/.remember/logs"
-    if [ -d "$_log_dir" ]; then
-        echo "$(date '+%H:%M:%S') [resolve] $_msg" >> "$_log_dir/memory-$(date '+%Y-%m-%d').log" 2>/dev/null
-    fi
-    exit 1
+    _resolve_paths_fail "$_msg" "${CLAUDE_PROJECT_DIR:-.}/.remember/logs" || return 1
 fi
 
 # --- Resolve PROJECT_DIR (the user's project root) ---
@@ -76,12 +102,7 @@ elif [[ "$PIPELINE_DIR" == *"/.claude/remember" ]]; then
     PROJECT_DIR="$(cd "$PIPELINE_DIR/../.." && pwd)"
 else
     _msg="FATAL: Cannot resolve project root. CLAUDE_PROJECT_DIR is not set and plugin is not in a local .claude/remember/ layout (PIPELINE_DIR=$PIPELINE_DIR)."
-    echo "$_msg" >&2
-    _log_dir="${PROJECT_DIR:-.}/.remember/logs"
-    if [ -d "$_log_dir" ]; then
-        echo "$(date '+%H:%M:%S') [resolve] $_msg" >> "$_log_dir/memory-$(date '+%Y-%m-%d').log" 2>/dev/null
-    fi
-    exit 1
+    _resolve_paths_fail "$_msg" "${PROJECT_DIR:-.}/.remember/logs" || return 1
 fi
 
 # --- Windows shell normalization (Git Bash / MSYS / Cygwin) ----------------
@@ -109,14 +130,12 @@ esac
 # --- Validate both paths exist ---
 if [ ! -d "$PROJECT_DIR" ]; then
     _msg="FATAL: PROJECT_DIR does not exist: $PROJECT_DIR"
-    echo "$_msg" >&2
-    exit 1
+    _resolve_paths_fail "$_msg" || return 1
 fi
 
 if [ ! -d "$PIPELINE_DIR" ]; then
     _msg="FATAL: PIPELINE_DIR does not exist: $PIPELINE_DIR"
-    echo "$_msg" >&2
-    exit 1
+    _resolve_paths_fail "$_msg" || return 1
 fi
 
 # --- Export for subprocesses (critical for nohup) ---

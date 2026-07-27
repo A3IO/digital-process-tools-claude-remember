@@ -143,7 +143,17 @@ if [ -f "$FIXTURES/sample-session.jsonl" ]; then
     # Create a temp project dir structure pointing to the fixture
     TMP_PROJECT=$(mktemp -d "$SYS_TMPDIR/remember-test-project-XXXXXX")
     cleanup_files+=("$TMP_PROJECT")
-    SESSION_DIR="$HOME/.claude/projects/$(echo "$TMP_PROJECT" | sed 's/[^a-zA-Z0-9]/-/g')"
+    # Same tree pipeline.shell reads (#166). Hardcoding $HOME/.claude here put
+    # the fixture somewhere the code no longer looks the moment a developer
+    # exports CLAUDE_CONFIG_DIR — which is the population this harness is most
+    # needed by. detect-tools.sh is not sourced in this script, so expand the
+    # variable the same way claude_projects_dir does.
+    # Ask the real implementation rather than restating it. This inline sed was
+    # safe only because mktemp -d yields ASCII — the same "agrees today, free to
+    # drift tomorrow" shape as the four copies of this rule #177 is about, and
+    # it would not survive a non-ASCII or over-200-character TMPDIR.
+    source "$(dirname "$0")/lib-slug.sh"
+    SESSION_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(session_dir_slug "$TMP_PROJECT")"
     mkdir -p "$SESSION_DIR" "$(dirname "$TMP_PROJECT/.remember/tmp/last-save.json")"
     mkdir -p "$TMP_PROJECT/.remember/tmp"
     cp "$FIXTURES/sample-session.jsonl" "$SESSION_DIR/test-session.jsonl"
