@@ -106,7 +106,10 @@ In practice, running this all day costs **a few cents per day**. The Anthropic A
 
 - Python 3.9+
 - Claude CLI (`claude`) with Haiku access
-- Bash 4+
+- Bash 3.2+ — stock macOS ships bash **3.2.57** and is a supported target.
+  On bash **4.2+** the per-prompt timestamp costs no subprocess at all
+  (`printf '%(...)T'`); on 3.2 it forks `date` once. Same output either way
+  ([#227](https://github.com/Digital-Process-Tools/claude-remember/issues/227)).
 - `jq` (used by `log.sh` / `session-start-hook.sh` to read `config.json`)
 - Standard coreutils (`date`, `find`, `tar`, `tr`, `wc`) — preinstalled on macOS/Linux
 
@@ -175,7 +178,9 @@ The plugin registers three Claude Code hooks:
 | `UserPromptSubmit` | `user-prompt-hook.sh`   | Injects current timestamp so the agent knows the time     |
 | `PostToolUse`      | `post-tool-hook.sh`     | Auto-saves session when tool call delta exceeds threshold |
 
-Each hook sources `log.sh` for shared config, timezone, logging, and the `dispatch()` system. Hooks dispatch lifecycle events (e.g., `after_user_prompt`) to extensible listeners in `hooks.d/`.
+`SessionStart` and `PostToolUse` source `log.sh` for shared config, timezone, logging, and the `dispatch()` system. Hooks dispatch lifecycle events (e.g., `after_user_prompt`) to extensible listeners in `hooks.d/`.
+
+`UserPromptSubmit` is the exception, and deliberately so: it runs on every prompt **and the user waits for it**, so it needs only the resolved memory directory and timezone. Rather than re-derive those through the full chain (`git rev-parse`, a slug, a three-layer config merge — 19 processes, and 27 on Windows/ARM64 under QEMU, where it cost a p50 of 8.7s per prompt), it replays the resolution a previous hook already published, via `lib-env-cache.sh`. The cache is refused unless it is newer than every `config.json` layer and was written for the same project, plugin root and `HOME`, so editing config still takes effect on the next prompt. It falls back to the full chain whenever it declines — including when you add a `hooks.d/after_user_prompt/` listener, which needs `dispatch()`. Set `REMEMBER_ENV_CACHE=0` to turn it off ([#227](https://github.com/Digital-Process-Tools/claude-remember/issues/227)).
 
 All three are registered together, from `hooks/hooks.json`, when the session starts — which is why enabling the plugin mid-session wires up none of them (see the install note above).
 
@@ -191,6 +196,10 @@ Reach for it whenever memory is not appearing and nothing says why — the two s
 
 Before clearing context or ending a session, type `/remember`. The agent writes a short handoff note to `.remember/remember.md` — what's done, what's next, any non-obvious context. The next session reads it and picks up where you left off. This is complementary to the automatic pipeline: the pipeline captures what happened, the handoff captures what matters next.
 
+**The slot is not emptied on read.** Session start delivers the note and records the delivery in `remember.delivered`; the note itself stays on disk until `/remember` writes its replacement. This is deliberate — a session that never writes a handoff back (a scheduled task passing through the project, a `claude -p` one-shot, a session you abandon) used to consume the note meant for your next real session and leave nothing behind ([#221](https://github.com/Digital-Process-Tools/claude-remember/issues/221)).
+
+The trade is that the same note can be delivered more than once. Every delivery after the first says so — *already delivered N times since ‹timestamp› — pending replacement, not news* — so a stale handoff is never mistaken for a fresh one. If you see that line, the fix is `/remember`: writing a new handoff retires the old.
+
 ## Data files
 
 The pipeline writes to `REMEMBER_DIR` (created automatically). By default this is `.remember/` inside your project root; in external storage mode it is a per-project subdirectory of `~/.remember/` (see [External storage mode](#external-storage-mode)).
@@ -203,6 +212,7 @@ The pipeline writes to `REMEMBER_DIR` (created automatically). By default this i
 | `archive.md`                   | Older history consolidated                        |
 | `archive-YYYY-MM-DD.md`        | Rotated archive slices — searchable, not auto-loaded |
 | `remember.md`                  | Handoff note written by `/remember`               |
+| `remember.delivered`           | Delivery record for the handoff above — fingerprint, first delivery, count |
 | `logs/`                        | Pipeline logs                                     |
 | `tmp/`                         | Lock files, cooldown markers                      |
 | `identity.md`                  | Per-project identity override (optional)          |
@@ -255,7 +265,10 @@ A few runtime overrides aren't in `config.json` because they're per-shell rather
 | `REMEMBER_DEBUG`   | `1` emits verbose hook/cooldown lines to logs; `0` silences them. Highest precedence: it beats the `debug` config option. Unset **and** `debug` unset, the defaults differ per script — `save-session.sh` verbose, the git-backup hook quiet — which this table used to paper over with a single "default `1`" (#176).                                                                                                                                                                                                                                                                                                            |
 | `REMEMBER_MODEL`   | Model used for summarization/consolidation (the `claude -p` call). Default `haiku`. Point it at a more capable tier (e.g. `sonnet`) to improve salience and compression-cap compliance — the call is backgrounded, so there's no interactive-latency cost. **`config.json` → `model` is the source of truth** (per-project); this env var overrides it. Blank falls back to the default.                                                                                              |
 | `REMEMBER_REJECT_PATTERN` | Overrides the reject-gate regex that keeps model refusals/clarifications out of the memory layer. Blank → the narrow built-in default (anchored refusal/clarification stems only); `none` → gate disabled (only the literal `SKIP` contract applies); anything else → a custom case-insensitive regex. An invalid regex falls back to the default rather than failing the run. **`config.json` → `reject_pattern` is the source of truth**; this env var overrides it.   |
-| `REMEMBER_OAUTH_TOKEN` | OAuth token for the nested `claude -p`, used **only when the child env has no `CLAUDE_CODE_OAUTH_TOKEN`** — some desktop / Agent-SDK hosts withhold it from hook subprocesses, so nothing ever saves ([#129](https://github.com/Digital-Process-Tools/claude-remember/issues/129)/[#131](https://github.com/Digital-Process-Tools/claude-remember/issues/131)). Create one with `claude setup-token`. **`config.json` → `haiku.oauth_token` is the source of truth**; this env var overrides it. The plugin holds this credential and passes it to the summarization CLI, so set it deliberately. A host-provided token always wins. |
+| `REMEMBER_OAUTH_TOKEN` | OAuth token for the nested `claude -p`, used **only when the child env has no `CLAUDE_CODE_OAUTH_TOKEN`** — some desktop / Agent-SDK hosts withhold it from hook subprocesses, so nothing ever saves ([#129](https://github.com/Digital-Process-Tools/claude-remember/issues/129)/[#131](https://github.com/Digital-Process-Tools/claude-remember/issues/131)). Create one with `claude setup-token`. **`config.json` → `haiku.oauth_token` is the source of truth**; this env var overrides it. The plugin holds this credential and passes it to the summarization CLI, so set it deliberately. A host-provided token always wins. This fallback has no automated test — see [`docs/verification.md`](docs/verification.md) for the manual procedure. |
+| `REMEMBER_MAX_CONCURRENT_SUMMARIZERS` | How many nested `claude -p` summarizers may run at once, host-wide. Default `4`. This is the depth bound too: a summarizer that re-entered the plugin runs *inside* its parent's call, so recursion appears as concurrency ([#204](https://github.com/Digital-Process-Tools/claude-remember/issues/204)). Not `1` on purpose — several projects saving at the same time is normal. When it fires, `DECLINED` appears in the daily log and the span is summarized on a later run. |
+| `REMEMBER_MAX_SUMMARIZERS_PER_MIN` | How many summarizers may be spawned in any 60-second window, host-wide. Default `12`. Covers the shape concurrency cannot see: a chain where each save spawns the next and no two ever overlap. A store saves at most once per `cooldowns.save_seconds`, so the default leaves room for roughly two dozen active projects. Same `DECLINED` log line when it fires. |
+| `REMEMBER_RUNTIME_DIR` | Where spawn records for the two caps above are kept. Default `~/.remember/run`. Derived from `HOME` alone so a child process that inherited no plugin environment still finds it — that is the point of the bound. Set it only to relocate the runtime state (a read-only home, a test harness); if it is unusable the caps stop applying and the daily log says the spawn was `UNBOUNDED`. |
 | `REMEMBER_TZ`      | Set automatically by `log.sh` from `config.json` → `timezone`. Don't set this manually unless you're debugging.                                                                                                                                                                                                                                                                       |
 
 ## External storage mode

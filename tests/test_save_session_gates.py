@@ -44,7 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # reaches before/around the gates; every call is appended to calls.log so a test
 # can assert what ran. call-haiku returns a SKIP so no summary is ever written.
 STUB_SHELL = '''\
-import os, sys, tempfile
+import os, sys, tempfile, time
 
 CALLS = os.environ["STUB_CALLS_LOG"]
 cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -70,6 +70,11 @@ elif cmd == "build-prompt":
     with open(sys.argv[6], "w") as f:
         f.write("a prompt with no placeholders\\n")
 elif cmd == "call-haiku":
+    if os.environ.get("STUB_HAIKU_DECLINE") == "1":
+        # The spawn guard refusing (#204) — exit 3, not 1. Distinct because the
+        # script must not count it against the span.
+        sys.stderr.write("call-haiku declined: stub: spawn cap reached\\n")
+        sys.exit(3)
     if os.environ.get("STUB_HAIKU_FAIL") == "1":
         sys.stderr.write("stub: simulated haiku failure\\n")
         sys.exit(1)
@@ -81,6 +86,30 @@ elif cmd == "call-haiku":
         # compression is in flight — the #142 window.
         with open(os.environ["STUB_MEMORY_FILE"], "a") as f:
             f.write(os.environ["STUB_APPEND_DURING_NDC"])
+    if is_ndc and os.environ.get("STUB_REPLACE_DURING_NDC"):
+        # Stand in for now.md being REPLACED with something shorter while the
+        # compression is in flight — a rotation, or another NDC round that
+        # committed its own tail first. The snapshot offset then points past
+        # the end of a file it no longer describes (#223).
+        with open(os.environ["STUB_MEMORY_FILE"], "w") as f:
+            f.write(os.environ["STUB_REPLACE_DURING_NDC"])
+    if is_ndc and os.environ.get("STUB_HOLD_LOCK_DURING_NDC"):
+        # Take the save lock and keep it, so the NDC commit that runs after
+        # this call returns is guaranteed to find it held by a LIVE process
+        # (STUB_HOLD_LOCK_PID is the test runner's own pid, so the primitive
+        # can neither steal nor adopt it). Done here, synchronously, rather
+        # than from the test process: the parent save still holds the lock
+        # when the subshell is backgrounded, and racing it from outside would
+        # make which side wins a matter of timing (#223).
+        lock_dir = os.environ["STUB_HOLD_LOCK_DURING_NDC"]
+        while True:
+            try:
+                os.mkdir(lock_dir)
+                break
+            except FileExistsError:
+                time.sleep(0.02)
+        with open(os.path.join(lock_dir, "pid"), "w") as f:
+            f.write(os.environ["STUB_HOLD_LOCK_PID"])
     fd, path = tempfile.mkstemp(suffix="-haiku")
     with os.fdopen(fd, "w") as f:
         if is_ndc:
@@ -120,7 +149,7 @@ def _make_env(tmp_path: Path, *, exchanges: int, humans: int, position: int = 50
     (plugin / "pipeline" / "shell.py").write_text(STUB_SHELL)
     for script in ("save-session.sh", "resolve-paths.sh", "detect-tools.sh",
                    "bootstrap-dirs.sh", "log.sh", "lib-memory-dir.sh",
-                   "lib-lock.sh", "lib-slug.sh"):
+                   "lib-lock.sh", "lib-slug.sh", "lib-clock.sh"):
         (plugin / "scripts" / script).write_text((REPO_ROOT / "scripts" / script).read_text())
 
     cfg = {"cooldowns": {"save_seconds": 0, "ndc_seconds": 999999},
@@ -154,6 +183,21 @@ def _make_env(tmp_path: Path, *, exchanges: int, humans: int, position: int = 50
         "STUB_HUMAN_COUNT": str(humans),
         "STUB_EXCHANGE_COUNT": str(exchanges),
         "STUB_MEMORY_FILE": str(project / ".remember" / "now.md"),
+        # Keep the clock on `date`, where a PATH shim can still reach it (#227).
+        #
+        # lib-clock.sh resolves "now" with bash's `printf '%(FMT)T'` builtin when
+        # the shell has one, and a builtin is not on PATH — so a test that fakes
+        # time by putting its own `date` in front of PATH finds the fake silently
+        # ignored on bash >= 4.2 and asserts against the real clock. That is what
+        # went red on the ubuntu legs and nowhere else, because macOS bash 3.2
+        # has no builtin to bypass it with.
+        #
+        # Set here rather than in the one test that shims `date` today, because
+        # nothing in a time-faking test's own text warns its author about a seam
+        # that has moved. Every shell test built from this helper gets the
+        # interceptable clock; the builtin path is pinned directly, and against
+        # `date` byte for byte, in tests/test_prompt_hook_spawns.py.
+        "REMEMBER_NO_PRINTF_T": "1",
     }
     return env, project, plugin, calls_log, session_id
 
