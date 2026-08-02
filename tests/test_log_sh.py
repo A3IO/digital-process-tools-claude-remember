@@ -12,13 +12,19 @@ the config, ``MEMORY_LOG_DATE`` should match the LA date. If log.sh
 has the ordering bug, it will match the UTC date instead.
 """
 
+from __future__ import annotations
+
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests import spawn_counting
+from tests.spawn_counting import make_shim_dir
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOG_SH = REPO_ROOT / "scripts" / "log.sh"
@@ -431,3 +437,550 @@ def _dispatch_warned_in_log(tmp_path: Path, keyword: str) -> bool:
         if keyword in log_file.read_text():
             return True
     return False
+
+
+# ── a failing hook's own diagnostic (#277) ───────────────────────────────────
+#
+# dispatch() ran every hook under `2>/dev/null` and reported a failure as
+# `hook failed: <event>/<file>` — no exit status, no reason. Both halves of a
+# dying hook's report were discarded at once, which is the least actionable
+# form a report can take.
+#
+# It is not hypothetical. #258's worst case died exactly this way: a corrupt
+# cooldown marker went into `$(( ))`, `50-git-backup.sh` runs `set -u`, and
+# bash said `garbage: unbound variable` — naming the fault precisely, into
+# /dev/null. The backup then stopped permanently and the only trace anybody
+# got was the nameless line.
+#
+# What these pin is the post-condition, not a function's return value: a hook
+# that dies with a diagnostic leaves that diagnostic in a file a human reads.
+# `/remember:doctor` reports "Recent errors" from `logs/hook-errors.log`, so
+# that is the file, and it is asserted by name.
+
+
+def _human_readable_reports(tmp_path: Path) -> str:
+    """Everything a human is ever shown about a dispatch failure.
+
+    The daily log (log()'s destination) and hook-errors.log, which
+    /remember:doctor tails under "Recent errors". Concatenated, because
+    "somewhere a human reads" is the contract; _doctor_reports below pins the
+    surfaced route specifically.
+    """
+    parts = []
+    for log_file in tmp_path.rglob("memory-*.log"):
+        parts.append(log_file.read_text(encoding="utf-8", errors="replace"))
+    parts.append(_doctor_reports(tmp_path))
+    return "\n".join(parts)
+
+
+def _doctor_reports(tmp_path: Path) -> str:
+    """Just hook-errors.log — the file /remember:doctor actually tails."""
+    out = []
+    for err_log in tmp_path.rglob("hook-errors.log"):
+        out.append(err_log.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(out)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="exit statuses and bash's own set -u diagnostic differ under Git Bash; "
+    "the capture itself is POSIX-shaped and is exercised on the POSIX legs.",
+)
+class TestFailingHookReportsWhyAndWithWhatStatus:
+    """#277 — the swallow that made #258 invisible."""
+
+    def test_the_dying_hooks_own_diagnostic_survives(self, tmp_path):
+        """The #258 fixture: `set -u` plus an unbound reference.
+
+        Bash prints `<name>: unbound variable` and the hook dies on that line,
+        above everything it was going to do. Before this change that sentence
+        went to /dev/null and the user was left with a filename.
+
+        NOT #258's literal `$(( ))` form, and the difference is worth naming:
+        under bash 3.2 (macOS's /bin/bash, the dev platform) an arithmetic
+        unbound reference prints the same diagnostic and then CONTINUES, exit
+        0 — where bash 5 exits 127. A fixture that dies on one platform and
+        not the other would pin nothing. A plain unbound expansion dies on
+        both, which is the property under test: a hook that failed said why.
+        """
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(
+            event_dir,
+            "50-dies.sh",
+            '#!/bin/bash\nset -u\necho "$REMEMBER_COOLDOWN_MARKER"\necho unreachable\n',
+        )
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert result.returncode == 0, f"dispatch failed: {result.stderr}"
+        reports = _human_readable_reports(tmp_path)
+        assert "unbound variable" in reports, (
+            "bash named the fault exactly and no human-readable file has it:\n"
+            + reports
+        )
+        assert "50-dies.sh" in reports, "the report must still name which hook"
+
+    def test_the_exit_status_is_reported(self, tmp_path):
+        """`rc=127` and `rc=1` are already different diagnoses, and the status
+        is free — it was simply thrown away with the `||`."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(event_dir, "50-rc.sh", "#!/bin/bash\nexit 42\n")
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert result.returncode == 0, f"dispatch failed: {result.stderr}"
+        reports = _human_readable_reports(tmp_path)
+        assert "42" in reports, (
+            "the hook's exit status is absent from every report:\n" + reports
+        )
+
+    def test_a_hook_that_says_nothing_is_reported_as_saying_nothing(self, tmp_path):
+        """Three states, not two: said something / said nothing / could not be
+        captured. A silent death must not read like a capture that failed."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(event_dir, "50-mute.sh", "#!/bin/bash\nexit 3\n")
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert result.returncode == 0, f"dispatch failed: {result.stderr}"
+        reports = _human_readable_reports(tmp_path)
+        assert "no stderr" in reports, (
+            "a hook that printed nothing should say so, not look like a "
+            "capture that did not happen:\n" + reports
+        )
+
+    def test_a_truncated_capture_says_it_truncated(self, tmp_path):
+        """A bound that hides its own existence is another instance of the
+        defect being fixed here. If lines are dropped, the report says so."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(
+            event_dir,
+            "50-chatty.sh",
+            '#!/bin/bash\nfor i in $(seq 1 40); do echo "STDERRLINE-$i" >&2; done\nexit 1\n',
+        )
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert result.returncode == 0, f"dispatch failed: {result.stderr}"
+        reports = _human_readable_reports(tmp_path)
+        assert "STDERRLINE-1" in reports, "the first lines are the diagnosis"
+        assert "STDERRLINE-40" not in reports, (
+            "40 lines of hook chatter reached the log unbounded — this fires "
+            "on every tool call"
+        )
+        assert "more line" in reports, (
+            "the capture was shortened and did not say so:\n" + reports
+        )
+
+    def test_the_report_is_one_line_per_failure(self, tmp_path):
+        """log() is a line protocol and doctor tails 5 lines. A multi-line
+        hook diagnostic must not turn one failure into five entries and push
+        the other four off the report."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(
+            event_dir,
+            "50-multiline.sh",
+            "#!/bin/bash\nprintf 'first\\nsecond\\nthird\\n' >&2\nexit 1\n",
+        )
+
+        _run_dispatch(tmp_path, hooks_dir)
+
+        failure_lines = [
+            line for line in _doctor_reports(tmp_path).splitlines()
+            if "50-multiline.sh" in line
+        ]
+        assert len(failure_lines) == 1, (
+            f"one failure produced {len(failure_lines)} report lines: {failure_lines}"
+        )
+        assert "second" in failure_lines[0] and "third" in failure_lines[0]
+
+    def test_hook_stderr_never_reaches_the_calling_stream(self, tmp_path):
+        """Why the `2>/dev/null` was there at all, and it stays true.
+
+        dispatch runs inside PostToolUse/UserPromptSubmit/SessionStart hooks;
+        nothing a third-party hook writes may become output of the process the
+        agent is reading. Capturing it must not un-do that.
+        """
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(
+            event_dir,
+            "50-loud.sh",
+            "#!/bin/bash\necho MARKER-LEAKED-TO-CALLER >&2\nexit 1\n",
+        )
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert "MARKER-LEAKED-TO-CALLER" not in result.stderr, (
+            "a hook's stderr reached the caller's own stderr"
+        )
+        assert "MARKER-LEAKED-TO-CALLER" not in result.stdout
+        assert "MARKER-LEAKED-TO-CALLER" in _human_readable_reports(tmp_path)
+
+    def test_a_hook_that_succeeds_stays_silent(self, tmp_path):
+        """Noise on the success path is what `2>/dev/null` was really buying.
+        A hook that chatters and exits 0 is not an event, and this runs on
+        every tool call."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(
+            event_dir,
+            "50-noisy-ok.sh",
+            "#!/bin/bash\necho MARKER-ROUTINE-NOISE >&2\nexit 0\n",
+        )
+
+        _run_dispatch(tmp_path, hooks_dir)
+
+        reports = _human_readable_reports(tmp_path)
+        assert "MARKER-ROUTINE-NOISE" not in reports, (
+            "a successful hook's stderr was logged — on every tool call"
+        )
+
+    def test_a_failing_hook_does_not_abort_a_caller_running_set_e(self, tmp_path):
+        """save-session.sh and run-consolidation.sh both `set -e` around their
+        dispatch calls. The old `|| log` made the failure non-fatal by
+        accident of syntax; capturing the status must keep that property, or a
+        third-party hook gains the power to stop a save."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        marker = tmp_path / "second-ran.txt"
+        _write_hook(event_dir, "10-fails.sh", "#!/bin/bash\necho boom >&2\nexit 9\n")
+        _write_hook(event_dir, "20-after.sh", f'#!/bin/bash\ntouch "{marker}"\n')
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert result.returncode == 0, (
+            f"a failing hook aborted the caller: rc={result.returncode} "
+            f"stderr={result.stderr}"
+        )
+        assert marker.exists(), "dispatch must continue to the next hook"
+
+    def test_stderr_that_cannot_be_captured_is_reported_as_uncaptured(self, tmp_path):
+        """The third state. If the capture file cannot be created, the report
+        must say the reason is missing rather than imply the hook was mute —
+        that distinction is the whole point of this issue."""
+        hooks_dir = tmp_path / "hooks.d"
+        event_dir = hooks_dir / "test_event"
+        event_dir.mkdir(parents=True)
+        _write_hook(event_dir, "50-dies.sh", "#!/bin/bash\necho why >&2\nexit 1\n")
+
+        # A regular FILE where the capture directory must be: creating the
+        # capture file underneath it is impossible, and no mkdir can fix it.
+        # Written by hand rather than through _make_dispatch_env, which would
+        # build the project tree a second time and collide with _run_dispatch.
+        remember_dir = tmp_path / "proj" / ".remember"
+        remember_dir.mkdir(parents=True, exist_ok=True)
+        (remember_dir / "tmp").write_text("not a directory", encoding="utf-8")
+
+        result = _run_dispatch(tmp_path, hooks_dir)
+
+        assert result.returncode == 0, f"dispatch failed: {result.stderr}"
+        reports = _human_readable_reports(tmp_path)
+        assert "50-dies.sh" in reports, "the failure must still be reported"
+        assert "not captured" in reports, (
+            "an uncapturable stderr must say so, not read as silence:\n" + reports
+        )
+
+
+# ── config() reads the merged config in one pass (#232) ──────────────────────
+#
+# config() used to spend one `jq` process per key. #230 measured PostToolUse at
+# 20 external spawns per tool call and named these reads as the largest
+# remaining block: three at log.sh source time (.timezone, .model,
+# .reject_pattern) plus two in the hook itself, all against the SAME merged
+# file. #232 collapses them into one read.
+#
+# Collapsing reads means reading keys before knowing they are wanted, and that
+# moves two things that are not the spawn count. Both are pinned here, because
+# the spawn count is the cheap half of this change and the semantics are the
+# half that can hurt: PostToolUse is the write path, and a config that reads as
+# "all defaults" there is a hook that quietly stops capturing.
+
+
+def _run_config_calls(tmp_path, bundled: str, project: str | None, calls: str,
+                      env_extra: dict | None = None):
+    """Source log.sh against a hand-written pair of config layers and run
+    arbitrary shell after it. Returns the CompletedProcess so a test can look
+    at stdout and stderr separately — the difference between "the default,
+    reported" and "the default, silently" is entirely in stderr."""
+    project_dir = tmp_path / "proj"
+    pipeline_dir = tmp_path / "plugin"
+    home = tmp_path / "home"
+    for d in (project_dir, pipeline_dir, home):
+        d.mkdir(parents=True, exist_ok=True)
+    (pipeline_dir / "config.json").write_text(bundled, encoding="utf-8")
+    if project is not None:
+        remember = project_dir / ".remember"
+        remember.mkdir(parents=True, exist_ok=True)
+        (remember / "config.json").write_text(project, encoding="utf-8")
+    script = f'''
+export PROJECT_DIR="{_bash_path(project_dir)}"
+export PIPELINE_DIR="{_bash_path(pipeline_dir)}"
+export HOME="{_bash_path(home)}"
+source "{_bash_path(LOG_SH)}"
+{calls}
+'''
+    env = {**os.environ, "HOME": _bash_path(home)}
+    for stale in ("REMEMBER_DIR", "_LIB_MEMORY_DIR_LOADED", "REMEMBER_TZ",
+                  "REMEMBER_MODEL", "REMEMBER_REJECT_PATTERN"):
+        env.pop(stale, None)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run([_BASH, "-c", script], env=env,
+                          capture_output=True, text=True, timeout=60)
+
+
+class TestConfigIsReadInOnePass:
+
+    def test_the_whole_config_is_read_with_one_jq(self, tmp_path):
+        """The assertion this change exists for.
+
+        log.sh asks three questions of the merged config while being sourced
+        and callers ask more afterwards. Every one of them used to be its own
+        `jq` process against the same unchanging file. Counted by execution
+        via a PATH shim, for the reason #227 gives: wall clock is what differs
+        between platforms, spawn count is what causes it.
+        """
+        if not shutil.which("jq"):
+            pytest.skip("no jq on PATH — the jq-free path is covered by "
+                        "test_jq_free_config.py")
+        spawn_log = tmp_path / "spawns.log"
+        shims = make_shim_dir(tmp_path, spawn_log)
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"model": "sonnet", "timezone": "UTC",
+                                "cooldowns": {"save_seconds": 45},
+                                "thresholds": {"delta_lines_trigger": 7}}),
+            project=None,
+            calls=(
+                "config '.cooldowns.save_seconds' 120 > /dev/null\n"
+                "config '.thresholds.delta_lines_trigger' 50 > /dev/null\n"
+                "config '.time_format' 24h > /dev/null\n"
+            ),
+            env_extra={"SPAWN_LOG": str(spawn_log),
+                       "PATH": f"{shims}{os.pathsep}{os.environ['PATH']}"},
+        )
+        assert result.returncode == 0, result.stderr
+        # Only reads of the MERGED config. lib-memory-dir.sh's pass-1
+        # `.data_dir` read is against the bundled layer and happens before the
+        # merged file exists at all — a different file, not a duplicate read.
+        reads = [line for line in spawn_counting.spawns(spawn_log)
+                 if line.startswith("jq ") and " -s " not in line
+                 and "remember-config-" in line]
+        assert len(reads) <= 1, (
+            f"{len(reads)} separate jq reads of the merged config, one per "
+            f"key, against a file that does not change between them:\n  "
+            + "\n  ".join(reads)
+        )
+
+    def test_a_config_that_does_not_parse_is_reported(self, tmp_path):
+        """A malformed config must not read as a tidy set of defaults.
+
+        The merge falls back to copying the bundled layer when it cannot
+        combine the layers, so the way a caller actually ends up holding an
+        unparseable merged config is a bundled layer that is itself broken.
+        In that state every config() call returns its built-in default — the
+        cooldown, the delta threshold, the model — and before this change it
+        did so without a word anywhere. That is a silent degraded read in the
+        hook that decides whether memory gets captured.
+
+        Defaults are still the right ANSWER; being quiet about them is not.
+        """
+        result = _run_config_calls(
+            tmp_path,
+            bundled='{"model": "sonnet",',      # truncated on purpose
+            project=None,
+            calls="config '.model' 'haiku'\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "haiku", (
+            "an unreadable config must still yield the caller's default — "
+            "reporting the problem must not turn into failing the read"
+        )
+        assert result.stderr.strip(), (
+            "an unreadable config.json produced no diagnostic at all: every "
+            "config() call silently became its hardcoded default"
+        )
+
+    def test_an_absent_key_is_not_reported_as_a_failed_read(self, tmp_path):
+        """The other half, and the reason the first half is not just `set -x`.
+
+        "the file says nothing about this key" and "the file could not be
+        read" must not collapse into the same observable. They produce the
+        same VALUE — the caller's default — so the only thing separating them
+        is that one of them is reported and the other is not.
+        """
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"model": "sonnet"}),
+            project=None,
+            calls="config '.cooldowns.save_seconds' 120\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "120"
+        assert result.stderr.strip() == "", (
+            "a key that is simply absent was reported as a problem — a "
+            "warning that fires on ordinary configs is a warning nobody "
+            f"reads: {result.stderr!r}"
+        )
+
+    def test_a_boolean_false_survives_the_one_pass_read(self, tmp_path):
+        """#159, restated against the new reader.
+
+        `features.ndc_compression: false` must come back as "false", not as
+        its default. Every one-pass flattening scheme has a natural way to
+        lose exactly this value (drop falsy, drop empty, drop null all look
+        alike from a distance), and this repo has already shipped that bug
+        once.
+        """
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"features": {"ndc_compression": False},
+                                "git_backup": {"gpg_sign": False}}),
+            project=None,
+            calls=("config '.features.ndc_compression' true\n"
+                   "config '.git_backup.gpg_sign' true\n"),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["false", "false"], result.stdout
+
+    def test_a_per_project_override_still_wins(self, tmp_path):
+        """The one-pass read is of the MERGED config, not of one layer."""
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"cooldowns": {"save_seconds": 99}}),
+            project=json.dumps({"cooldowns": {"save_seconds": 999}}),
+            calls="config '.cooldowns.save_seconds' 120\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "999"
+
+    def test_the_oauth_token_is_not_left_lying_in_a_shell_variable(self, tmp_path):
+        """#230 refused to cache the merged config because it can carry
+        `haiku.oauth_token`, a live credential — which is why lib-memory-dir.sh
+        creates that file 0600, per PID, under an EXIT trap. Reading every key
+        up front is the same trade taken through a different door: the token
+        would sit in a shell variable in every process that sources log.sh,
+        for as long as it lives, in a hook that also runs other people's
+        scripts via dispatch().
+
+        Nothing needs it there. pipeline/haiku.py reads the token from the
+        merged file in Python; no config() caller asks for `.haiku.*` at all.
+        So it stays out of the bulk read, and this pins that.
+        """
+        token = "sk-ant-oat01-NOT-A-REAL-TOKEN-0123456789"
+        dump = tmp_path / "shell-vars.txt"
+        # The token is never written into the script itself — bash publishes
+        # the whole -c string as BASH_EXECUTION_STRING, so a grep spelled out
+        # here would find its own argument and pass for the wrong reason.
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"model": "sonnet",
+                                "haiku": {"oauth_token": token}}),
+            project=None,
+            calls=("config '.model' haiku\n"
+                   f'( set -o posix; set ) > "{_bash_path(dump)}"\n'),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "sonnet"
+        assert token not in dump.read_text(encoding="utf-8", errors="replace"), (
+            "the OAuth token was read into a shell variable by a config() "
+            "call that did not ask for it"
+        )
+
+    def test_the_token_is_still_readable_when_it_is_actually_asked_for(self, tmp_path):
+        """Keeping it out of the bulk read must not make it unreadable — that
+        would be the same silent-degraded-read defect wearing a security
+        rationale."""
+        token = "sk-ant-oat01-NOT-A-REAL-TOKEN-0123456789"
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"haiku": {"oauth_token": token}}),
+            project=None,
+            calls="config '.haiku.oauth_token' ''\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == token
+
+
+class TestConfigRefusesRatherThanGuesses:
+    """A flattened table maps `a.b` onto a shell variable name, and there are
+    config shapes where that mapping would answer the wrong question with a
+    straight face. The reader refuses those and reads them one key at a time
+    instead — which is the pre-#232 path, so the answers stay right.
+
+    These are not hypothetical shapes: they are the three ways the mapping can
+    lose. Each is asserted by the VALUE it must still return, not by which path
+    produced it, so they hold whichever way a future rewrite goes.
+    """
+
+    def test_two_keys_that_flatten_to_the_same_name_do_not_shadow_each_other(self, tmp_path):
+        """`{"a": {"b": 1}, "a_b": 2}` — both become `a_b` under any
+        dot-to-underscore mapping. One of them would silently return the
+        other's value."""
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"a": {"b": 1}, "a_b": 2}),
+            project=None,
+            calls=("config '.a.b' 0\n"
+                   "config '.a_b' 0\n"),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["1", "2"], result.stdout
+
+    def test_a_value_containing_a_newline_is_not_truncated(self, tmp_path):
+        """reject_pattern is a user-supplied regex. A line-based table would
+        keep everything up to the first newline and drop the rest — a gate
+        that silently matches less than it was told to."""
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"reject_pattern": "one\ntwo"}),
+            project=None,
+            calls="config '.reject_pattern' ''\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "one\ntwo\n", repr(result.stdout)
+
+    def test_a_refused_shape_is_not_reported_as_a_broken_config(self, tmp_path):
+        """The other side of test_a_config_that_does_not_parse_is_reported.
+
+        Declining to flatten a perfectly valid config is a fast-path decision,
+        not a fault, and it happens on every single hook invocation for as long
+        as the config keeps that shape. A warning there would fire hundreds of
+        times a session on a file with nothing wrong with it, and would teach
+        people to ignore the one that means something.
+        """
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"a": {"b": 1}, "a_b": 2}),
+            project=None,
+            calls="config '.a.b' 0\n",
+        )
+        assert result.returncode == 0
+        assert result.stderr.strip() == "", result.stderr
+
+    def test_a_key_under_an_array_does_not_break_the_read(self, tmp_path):
+        """config() has no syntax for indexing an array, so paths through one
+        are skipped — but their presence must not cost the file its fast path
+        or its neighbours their values."""
+        result = _run_config_calls(
+            tmp_path,
+            bundled=json.dumps({"notes": ["a", "b"], "model": "sonnet"}),
+            project=None,
+            calls="config '.model' haiku\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "sonnet"

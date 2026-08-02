@@ -22,11 +22,20 @@
 #   Not intended for manual invocation.
 #
 # STDIN
-#   The PostToolUse JSON payload. Consumed here, and re-exported as
-#   REMEMBER_HOOK_STDIN for hooks.d/after_post_tool scripts. Read is bounded
-#   (never from a tty, `read -t 1`): this fires on every tool call, so a
-#   blocking read is a hung agent. Anything unusable falls back to the
-#   pre-#212 mtime behaviour rather than failing.
+#   The PostToolUse JSON payload. It embeds the full tool result, so it is
+#   UNBOUNDED IN SIZE — hundreds of KB after a large Read or a verbose Grep.
+#   Consumed here, and published to hooks.d/after_post_tool scripts at the
+#   bottom of this file. It is deliberately not exported for the body of this
+#   hook to carry; the block above the publish says why (#266).
+#
+#   The read is bounded in TIME and only in time — `read -t 1`, and never from
+#   a tty, because this fires on every tool call and a blocking read is a hung
+#   agent rather than a slow one. Nothing here caps how MUCH is read. The size
+#   question is answered at the publish, not at the read; do not take the word
+#   "bounded" in this section as an answer to it.
+#
+#   Anything unusable falls back to the pre-#212 mtime behaviour rather than
+#   failing.
 #
 # ENVIRONMENT
 #   CLAUDE_PLUGIN_ROOT   Plugin install directory (set by Claude Code)
@@ -47,9 +56,16 @@
 # session-start-hook.sh. This hook must never block the agent, so a resolution
 # failure (e.g. a nested/headless session with no CLAUDE_PROJECT_DIR) is a
 # silent no-op, not a crash.
-REMEMBER_PATHS_SOFT_FAIL=1 source "$(dirname "$0")/resolve-paths.sh" || exit 0
-source "$(dirname "$0")/detect-tools.sh"
-source "$(dirname "$0")/bootstrap-dirs.sh"
+#
+# Resolved by parameter expansion rather than three `dirname` forks (#230) —
+# the same pattern log.sh and user-prompt-hook.sh already use. A path with no
+# slash in it (invoked as `bash post-tool-hook.sh` from the scripts dir) leaves
+# the filename behind, not a directory; `dirname` answered "." and this must too.
+_HOOK_DIR="${BASH_SOURCE[0]%/*}"
+[ "$_HOOK_DIR" = "${BASH_SOURCE[0]}" ] && _HOOK_DIR="."
+REMEMBER_PATHS_SOFT_FAIL=1 source "$_HOOK_DIR/resolve-paths.sh" || exit 0
+source "$_HOOK_DIR/detect-tools.sh"
+source "$_HOOK_DIR/bootstrap-dirs.sh"
 PLUGIN_ROOT="$PIPELINE_DIR"
 PROJECT="$PROJECT_DIR"
 source "$PLUGIN_ROOT/scripts/log.sh" 2>/dev/null
@@ -65,14 +81,27 @@ log "hook" "post-tool: PROJECT_DIR=$PROJECT_DIR PIPELINE_DIR=$PIPELINE_DIR PYTHO
 
 # --- Which session is this invocation FOR? (#212) ---
 # PostToolUse supplies the answer on stdin. Read it here, once, before anything
-# else wants it, and re-export the raw payload: this hook consumes stdin, so a
-# hooks.d/after_post_tool script that wanted it would otherwise find EOF.
+# else wants it.
+#
+# Into a plain shell variable, NOT an exported one (#266). Everything below
+# this line forks, and an exported string the size of a tool result makes every
+# one of those forks fail. This hook does consume stdin, so a
+# hooks.d/after_post_tool script that wanted the payload would find EOF — it
+# still gets it, by a route that is not the environment, at the bottom of this
+# file.
 #
 # Reading stdin is only safe if it cannot wait forever — this runs on EVERY
 # tool call, so a blocking read is a hung agent, not a slow one. Two guards:
 # a tty stdin (hand invocation from a shell) is never read at all, and the read
 # itself is bounded by `-t 1` so a pipe held open with nothing in it costs a
 # second and then gives up. bash 3.2 has no sub-second -t, hence 1.
+# Cleared, not merely left alone. This plugin can re-enter its own hooks from a
+# nested session (#204), and both names are exported at the bottom of this file
+# — so without this an inner invocation could read an OUTER invocation's
+# payload and take it for its own. Absent is the correct answer when this
+# invocation has no payload; a stale one is the plausible-and-wrong answer.
+unset REMEMBER_HOOK_STDIN REMEMBER_HOOK_STDIN_FILE
+
 HOOK_STDIN=""
 if [ ! -t 0 ]; then
     _line=""
@@ -81,7 +110,6 @@ if [ ! -t 0 ]; then
         _line=""
     done
 fi
-export REMEMBER_HOOK_STDIN="$HOOK_STDIN"
 
 # Extract "session_id" without forking a JSON parser on every tool call.
 # Deliberately narrow: the key must be followed by nothing but whitespace and a
@@ -129,13 +157,30 @@ SESSION_DIR="$(claude_projects_dir)/$(session_dir_slug "$PROJECT")"
 # mis-slugged), so the warning would fire once and every later session would be
 # silent again — the very failure being fixed. An hourly repeat keeps a
 # persistent cause visible without flooding.
+#
+# `ls -t … | head -1` is two processes and it STAYS two processes (#230). The
+# obvious replacement — glob the directory and keep the newest with `[ "$f" -nt
+# "$newest" ]` — is spawn-free and WRONG here: under bash 3.2 (stock macOS)
+# `-nt` compares mtimes at ONE-SECOND granularity, the same trap recorded below
+# the capture-alive marker. Two transcripts written in the same second tie, and
+# a tie makes the loop keep whichever the glob listed first — alphabetical order,
+# not newest. `ls -t` reads the full mtime and does not tie.
+#
+# The value picked here decides which session this invocation is recorded FOR
+# whenever stdin does not answer (#212). Trading a correct answer for two
+# processes on the WRITE path is not a trade; misattributing a tool call is a
+# bug, and this repo has twice turned that bug into an outage (#204, #129).
 NOTICE_TTL=3600
 LATEST_JSONL=$(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null | head -1)
 if [ -z "$LATEST_JSONL" ]; then
     NOTICE_MARKER="$REMEMBER_DIR/tmp/no-transcript-notice"
     NOTICE_LAST=0
     if [ -f "$NOTICE_MARKER" ]; then
-        NOTICE_LAST=$(cat "$NOTICE_MARKER" 2>/dev/null || echo 0)
+        # `read`, not `cat` (#230). Status untested on purpose: `read` returns 1
+        # on a file with no trailing newline having set the variable anyway, and
+        # a timestamp written with `printf` is exactly that file. The case guard
+        # below is what decides whether the value is usable.
+        read -r NOTICE_LAST < "$NOTICE_MARKER" 2>/dev/null
         case "$NOTICE_LAST" in ''|*[!0-9]*) NOTICE_LAST=0 ;; esac
     fi
     if [ $(( $(_remember_date +%s) - NOTICE_LAST )) -ge "$NOTICE_TTL" ]; then
@@ -149,7 +194,12 @@ if [ -z "$LATEST_JSONL" ]; then
     fi
     exit 0
 fi
-rm -f "$REMEMBER_DIR/tmp/no-transcript-notice" 2>/dev/null
+# Gated on the marker existing (#230): this line runs on every tool call, and
+# the file it clears is written only in the slug-mismatch case above — which is
+# to say, essentially never. `rm` on a path that is not there is a process spent
+# to do nothing.
+[ -f "$REMEMBER_DIR/tmp/no-transcript-notice" ] && \
+    rm -f "$REMEMBER_DIR/tmp/no-transcript-notice" 2>/dev/null
 
 # --- One transcript, one session, one answer (#212) ---
 # Everything below is about ONE session: the marker vouches for it, the saved
@@ -174,8 +224,17 @@ else
     [ -n "$STDIN_SESSION_ID" ] && log "hook" "post-tool: stdin session $STDIN_SESSION_ID has no transcript in $SESSION_DIR — falling back to newest"
 fi
 
-CURRENT_LINES=$(wc -l < "$TRANSCRIPT" | tr -d ' ')
-SESSION_ID=$(basename "$TRANSCRIPT" .jsonl)
+# `wc -l` on BSD pads its output with leading spaces, which is why `tr -d ' '`
+# was here. Arithmetic expansion strips whitespace on its own, so the pipe's
+# second process goes (#230) — and a `wc` that printed nothing usable now yields
+# 0 rather than the empty string, which every comparison below already treated
+# as 0 anyway.
+CURRENT_LINES=$(wc -l < "$TRANSCRIPT" 2>/dev/null)
+CURRENT_LINES=$(( CURRENT_LINES + 0 ))
+# Parameter expansion, not `basename` (#230): strip the directory, then the
+# extension. Same answer, no process.
+SESSION_ID="${TRANSCRIPT##*/}"
+SESSION_ID="${SESSION_ID%.jsonl}"
 
 # Which session PostToolUse serviced, for the capture-gap check in
 # session-start-hook.sh (#200). Distinct from the post-tool-ran marker above:
@@ -205,7 +264,12 @@ SESSION_ID=$(basename "$TRANSCRIPT" .jsonl)
 # The single file is still written. doctor.sh reads it, and it is the only
 # evidence an install upgrading from the old format has for the session that
 # straddles the upgrade.
-if mkdir -p "$REMEMBER_DIR/tmp/capture-alive.d" 2>/dev/null; then
+# `[ -d ]` before the `mkdir` (#230). Every tool call after the first in a
+# session finds this directory already there, and asking `mkdir -p` to confirm
+# that costs a process each time. The mkdir still runs — and still gates the
+# write on its success — the first time, and on any run where it is missing.
+if [ -d "$REMEMBER_DIR/tmp/capture-alive.d" ] \
+    || mkdir -p "$REMEMBER_DIR/tmp/capture-alive.d" 2>/dev/null; then
     # The id becomes a path component, so it is checked rather than trusted:
     # it comes from a filename in the transcript dir, and `..` or a slash
     # would escape the store. Real session ids are UUIDs.
@@ -250,7 +314,11 @@ SAVE_TRIGGERED=""
 IN_COOLDOWN=false
 COOLDOWN_MARKER="$REMEMBER_DIR/tmp/last-save-ts"
 if [ -f "$COOLDOWN_MARKER" ]; then
-    LAST_TS=$(cat "$COOLDOWN_MARKER" 2>/dev/null || echo 0)
+    # `read`, not `cat` (#230) — see the note on NOTICE_LAST above. This one is
+    # on the hot path proper: the cooldown marker exists for the whole of any
+    # session that has saved once, so this ran on every tool call.
+    LAST_TS=0
+    read -r LAST_TS < "$COOLDOWN_MARKER" 2>/dev/null
     case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
     SAVE_COOLDOWN=$(config ".cooldowns.save_seconds" 120)
     case "$SAVE_COOLDOWN" in ''|*[!0-9]*) SAVE_COOLDOWN=120 ;; esac
@@ -278,4 +346,88 @@ fi
 
 # --- Dispatch: after_post_tool ---
 export REMEMBER_SAVE_TRIGGERED="$SAVE_TRIGGERED"
+
+# The stdin payload is published to listeners HERE, and only around the
+# dispatch that consumes it (#266).
+#
+# It used to be `export REMEMBER_HOOK_STDIN="$HOOK_STDIN"` at the top of the
+# file. The payload embeds the whole tool result, so after a large Read it is
+# hundreds of KB, and an exported variable sits in `envp` for every `execve`
+# the rest of the hook performs. Every one of them then fails E2BIG — `sed`
+# from lib-slug.sh, `head` from here, `date` from lib-clock.sh, `rm` on exit,
+# four different libraries — silently, because this hook must not block the
+# agent, and on every large tool call for the rest of the session.
+#
+# The environment was never a working route for this payload. Linux caps a
+# SINGLE string at MAX_ARG_STRLEN (32 pages = 131072 bytes) in `envp` exactly
+# as in `argv`, independently of the total ARG_MAX the size limit is usually
+# discussed in terms of. So on the platform this was reported from, the exec
+# that would hand a 200 KB payload to a listener is the exec that fails: the
+# capability was declared and could not be performed. macOS has no per-string
+# cap and a 1 MB total, which is why it took an outside report to find — here
+# it "works" right up to the point the whole environment blows the total.
+#
+# So the payload travels in a file, and REMEMBER_HOOK_STDIN keeps carrying it
+# only while it is small enough to be carried. What it must never do is carry
+# PART of it. A listener holding a silently shortened payload cannot tell it
+# from a genuinely short one, and that is this repo's own defect class (#144,
+# #263): a surface that appears to answer the question and does not. Three
+# states, and the third is disclosed rather than disguised:
+#
+#   FILE unset                     no payload arrived on stdin, or no listener
+#   STDIN non-empty                the whole payload, exactly as before
+#   STDIN empty and FILE set       too large for the environment; the file
+#                                  holds it, complete
+#
+# REMEMBER_HOOK_STDIN_FILE is the authoritative route: where it is set it is
+# always the complete payload, so a listener that only ever reads the file is
+# always right and never needs to know a cap exists. (If that write fails —
+# a full or read-only tmp — an oversized payload is unavailable rather than
+# short. Absent beats plausible-and-wrong.)
+#
+# None of it happens unless a listener is installed. The distribution ships
+# hooks.d/after_post_tool/ holding nothing but a .gitkeep, and this runs on
+# every tool call, so writing a payload to disk for a consumer that does not
+# exist is a per-tool-call write bought for nobody. Tested with a glob rather
+# than a fork, the same way dispatch defers `id` (#230).
+REMEMBER_HOOK_STDIN_MAX=32768
+_hook_stdin_file=""
+
+_after_post_tool_listener() {
+    local f
+    for f in "$REMEMBER_HOOKS_DIR/after_post_tool"/*; do
+        [ -x "$f" ] && return 0
+    done
+    return 1
+}
+
+if [ -n "$HOOK_STDIN" ] && _after_post_tool_listener; then
+    _hook_stdin_file="$REMEMBER_DIR/tmp/hook-stdin.$$"
+    # The payload carries tool output, so it is owner-readable only, and it
+    # does not outlive the dispatch below.
+    if (umask 077; printf '%s' "$HOOK_STDIN" > "$_hook_stdin_file") 2>/dev/null; then
+        export REMEMBER_HOOK_STDIN_FILE="$_hook_stdin_file"
+    else
+        # A write that failed part way through (a full tmp) leaves a short file
+        # holding tool output. Nothing may be told about it — a half payload is
+        # the truncation this fix exists to refuse — and it may not be left
+        # behind either.
+        rm -f "$_hook_stdin_file" 2>/dev/null
+        _hook_stdin_file=""
+    fi
+    if [ "${#HOOK_STDIN}" -le "$REMEMBER_HOOK_STDIN_MAX" ]; then
+        export REMEMBER_HOOK_STDIN="$HOOK_STDIN"
+    else
+        export REMEMBER_HOOK_STDIN=""
+    fi
+fi
+
 dispatch "after_post_tool"
+
+[ -n "$_hook_stdin_file" ] && rm -f "$_hook_stdin_file" 2>/dev/null
+
+# Explicit, because the line above is the last command and it is false whenever
+# no payload file was written — which is the common case. Falling off the end
+# would exit 1 and make a hook that must never fail report failure on every
+# ordinary tool call.
+exit 0

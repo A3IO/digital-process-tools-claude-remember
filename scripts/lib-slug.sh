@@ -157,15 +157,92 @@ _remember_should_check_utf8() {
     return 1
 }
 
+# The two alphabets, for the drive-letter fold below. Held as constants so the
+# fold is a pair of parameter expansions and not a fork: session_dir_slug runs
+# on every single tool call.
+#
+# `${x,,}` would be one expansion and is what this used to use — but it is bash
+# 4 syntax, a runtime "bad substitution" on macOS's bash 3.2. The CYGPATH_STUB
+# in tests/test_config_dir_normalisation.py already avoids it for exactly that
+# reason; used here it made the cygpath branch unrunnable on the platform this
+# is developed on, so that branch had no local coverage at all.
+_REMEMBER_DRIVE_UPPER="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_REMEMBER_DRIVE_LOWER="abcdefghijklmnopqrstuvwxyz"
+
 session_dir_slug() {
     local path="$1"
+    local _drive_at
     if command -v cygpath >/dev/null 2>&1; then
         local winpath
         winpath=$(cygpath -w "$path" 2>/dev/null) || winpath="$path"
-        # Lowercase the drive letter (first character) to match Claude Code.
-        path="${winpath:0:1}"
-        path="${path,,}${winpath:1}"
+        # An exit status is not the only way cygpath declines to answer: it can
+        # exit 0 and print nothing, and that emptied the path outright — the
+        # slug became "" and resolved to ~/.claude/projects/ itself. The same
+        # guard is already on claude_projects_dir's cygpath call a hundred
+        # lines above; this one did not have it. Nothing back means keep what
+        # we were given (#294).
+        [ -n "$winpath" ] || winpath="$path"
+        # Past MAX_PATH, `cygpath -w` answers in the Win32 long-path spelling:
+        # \\?\C:\dev\... for a drive path, \\?\UNC\server\share\... for a UNC
+        # one. Strip that back off before anything below looks at the string,
+        # with parameter expansions rather than a fork — this runs on every
+        # single tool call (#294).
+        #
+        # The prefix is OURS. Claude Code slugs the cwd it holds and never adds
+        # it, so a slug carrying it names a directory that does not exist —
+        # four leading dashes and a different hash, the #157/#166 silent miss.
+        # And the fold below is `case "$path" in ?:*)`, which \\?\C: cannot
+        # match, so the drive letter also stopped folding: #263's condition,
+        # reintroduced for exactly the deep paths the 200-char truncation
+        # exists to protect.
+        #
+        # \\?\UNC\ maps back to \\ and not to nothing: it IS \\server\share,
+        # spelled for Win32, and dropping the two leading separators would slug
+        # one directory two ways just as surely — the same argument as #263,
+        # with no drive letter to fold.
+        #
+        # Inside the cygpath branch on purpose: this undoes what cygpath just
+        # did, and nothing more. A backslash is an ordinary filename byte on
+        # Linux, so a directory literally named \\?\C: can exist there and
+        # Claude Code would slug it literally. Stripping unconditionally would
+        # rename that store. Same reason pipeline/slug.py is untouched — it
+        # never runs cygpath, so it never sees a prefix this plugin put there.
+        case "$winpath" in
+            '\\?\UNC\'*) winpath='\\'"${winpath#'\\?\UNC\'}" ;;
+            '\\?\'*)     winpath="${winpath#'\\?\'}" ;;
+        esac
+        path="$winpath"
     fi
+    # Lowercase the drive letter to match Claude Code — unconditionally, not
+    # only when cygpath happens to be on PATH (#263).
+    #
+    # That condition is what let one machine produce both spellings. With
+    # cygpath present every shape converges here and there is no bug; with it
+    # absent this step was skipped entirely, so a path resolve-paths.sh had
+    # uppercased stayed uppercase while a shape it could not match stayed
+    # lowercase. The store split in two, and only git could see it.
+    #
+    # The direction is not a free choice. Git for Windows ships cygpath, so the
+    # working majority already has the lowercase spelling on disk; uppercasing
+    # would fix one reporter and rename every other store — trading a loud bug
+    # for a quiet one. Only the drive letter is touched: every component after
+    # it keeps its case, on Windows and in Claude Code's slug alike.
+    # `?:*` and not `[A-Z]:*`: a bracket range in a case pattern follows the
+    # locale's collation, and under en_US.UTF-8 `[A-Z]` matches lower-case
+    # letters too — the same trap that made the slug sed locale-proof by hand
+    # above. The membership test below is the range check, done with a literal
+    # substring and therefore collation-free: a first character that is not an
+    # upper-case ASCII letter leaves the whole prefix intact and nothing is
+    # folded. Without that, a locale-widened match would index past the end of
+    # the lower-case alphabet and silently DELETE the drive letter.
+    case "$path" in
+        ?:*)
+            _drive_at="${_REMEMBER_DRIVE_UPPER%%"${path:0:1}"*}"
+            if [ "$_drive_at" != "$_REMEMBER_DRIVE_UPPER" ]; then
+                path="${_REMEMBER_DRIVE_LOWER:${#_drive_at}:1}${path:1}"
+            fi
+            ;;
+    esac
     # The UTF-8 well-formedness table, one expression per row. Ranges matter:
     # a lead byte does not accept every continuation. \355 (U+D800-DFFF, the
     # surrogate block) and the overlong \340/\360 forms are not valid UTF-8,

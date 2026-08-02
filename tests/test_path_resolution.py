@@ -1191,11 +1191,17 @@ class TestWindowsCompatIssue11:
         assert ":" not in result, "Colons not replaced"
 
     def test_session_dir_matches_bash_slug(self):
-        """Python slug matches bash sed 's/[^a-zA-Z0-9]/-/g' for all path types."""
+        """Python slug matches bash sed 's/[^a-zA-Z0-9]/-/g' for all path types.
+
+        The drive letter is lower-cased (#268): bash's session_dir_slug folds
+        it unconditionally since #263, and pipeline/slug.py now does the same
+        — Git for Windows ships cygpath, so the working majority's on-disk
+        stores are already spelled that way.
+        """
         for path, expected_slug in [
             ("/home/user/project", "-home-user-project"),
-            ("D:\\Users\\dev\\project", "D--Users-dev-project"),
-            ("D:/Users/dev/project", "D--Users-dev-project"),
+            ("D:\\Users\\dev\\project", "d--Users-dev-project"),
+            ("D:/Users/dev/project", "d--Users-dev-project"),
             ("/Users/dev/My Project", "-Users-dev-My-Project"),
         ]:
             result = _session_dir(path)
@@ -1271,10 +1277,11 @@ class TestWindowsCompatIssue11:
         """End-to-end: a /c/Users/... path post-normalization slugs to the same folder Claude Code uses."""
         # After resolve-paths.sh normalizes /c/Users/dev/project → C:\Users\dev\project,
         # the Python _session_dir (and bash sed) must produce the same slug Claude Code
-        # uses to store session JSONLs on Windows.
+        # uses to store session JSONLs on Windows — with the drive letter lower-cased
+        # (#268), matching bash's session_dir_slug fold (#263).
         normalized = r"C:\Users\dev\project"
         slug = _session_dir(normalized).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        assert slug == "C--Users-dev-project", (
+        assert slug == "c--Users-dev-project", (
             f"Normalized Win32 path slug mismatch: got {slug!r}"
         )
 
@@ -3648,6 +3655,12 @@ echo "DISPATCH_COMPLETED=true"
         meant for the next human session. The slot now survives until a
         replacement lands; the delivery is recorded in remember.delivered,
         which is what keeps a stale note from reading as fresh forever.
+
+        That record is per-clone state and lives in tmp/ with the locks and
+        cooldown markers since #285 — at the store root the git backup
+        committed it, and a second machine's first delivery then read as
+        already-seen. tests/test_delivery_record_per_machine_285.py owns that
+        behaviour; this one only pins where the record is written.
         """
         project = os.path.join(str(tmp_path), "user-project")
         plugin = os.path.join(str(tmp_path), "cache", "org", "remember", "0.5.0")
@@ -3680,8 +3693,11 @@ echo "DISPATCH_COMPLETED=true"
             f"remember.md must survive delivery until replaced. Contains: {remaining[:100]}"
         )
         # And the delivery is on record, so the next read knows it is stale.
-        record = os.path.join(project, ".remember", "remember.delivered")
+        record = os.path.join(project, ".remember", "tmp", "remember.delivered")
         assert os.path.exists(record), "delivery record not written"
+        assert not os.path.exists(
+            os.path.join(project, ".remember", "remember.delivered")
+        ), "the record must not be written where the backup would commit it (#285)"
         with open(record) as f:
             assert "deliveries=1" in f.read()
 
