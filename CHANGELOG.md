@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.0] — The slug, written down
 
 ### Added
 
@@ -94,8 +94,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Left open deliberately: no dispatched hook has a timeout.** They run sequentially in the foreground of `PostToolUse`, so one that hangs stalls the agent indefinitely and logs nothing, because nothing has failed. It is not folded in here because the fix is a design rather than a repair — killing a listener mid-flight can leave a `.git/index.lock` behind in the very backup hook this plugin ships, and choosing a default that is generous enough for a network push and short enough to matter is a separate judgement with a separate blast radius. Filed rather than fixed.
 
   Tests first (`tests/test_hook_stdout_labelling_280.py`), red 6/7 — the one that passed on the untouched code is the guard that a silent hook adds no framing, which is what a test asserting *absence* is for — then green 7/7, full suite 1267 passed, 43 skipped, coverage 94.16%.
-
-### Fixed
 
 - **`pipeline/slug.py` did not fold the Windows drive letter that `scripts/lib-slug.sh` has folded since #263** ([#268](https://github.com/Digital-Process-Tools/claude-remember/issues/268)) — `resolve-paths.sh` normalises `CLAUDE_PROJECT_DIR` to the native Win32 form with an UPPER-case drive before either side ever sees it. Bash then lower-cases that drive letter unconditionally; Python is a faithful transcription of Claude Code's own JXA slug routine, which never receives a raw drive letter at all (the host folds before calling it), so the transcription had nothing to fold either — and slugged the upper-case drive literally. `C--Users-…` from Python against `c--Users-…` from bash, for the same directory. NTFS resolves both, so nothing failed and nothing reported it; `extract.py` uses the Python slug to find the session directory, so it read a differently-cased path than the store the git-backup hook tracks.
 
