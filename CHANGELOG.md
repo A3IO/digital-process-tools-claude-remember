@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A compaction no longer re-injects the whole memory recap** ([#339](https://github.com/Digital-Process-Tools/claude-remember/issues/339)) — `SessionStart` fires at every auto-compaction with `source=compact`, and the hook read `session_id` out of that payload ([#206](https://github.com/Digital-Process-Tools/claude-remember/issues/206)/[#270](https://github.com/Digital-Process-Tools/claude-remember/issues/270)) while discarding `source`. Every memory file was therefore `cat`'d again, into a context that had just been replaced by a summary of the conversation those same bytes were already in. The reporter measured `compact` firing about as often as `startup` over 40 days.
+
+  **A compaction is not a new session.** The store has not changed since this session started and the recap is not news, so at `source=compact` the bodies are not repeated — with one exception.
+
+  **Identity still is.** `identity.md` works by *presence*: a path to it does not make the agent behave as that persona, and no other line of the hook's output even names the file. Everything else is recall-on-demand and stays addressable — the unconditional `=== REMEMBER ===` hint names the store's files on every fire, and the `=== MEMORY ===` block now names the withheld ones again with their sizes. That is [#124](https://github.com/Digital-Process-Tools/claude-remember/issues/124)'s vocabulary for "kept but not injected": a recap that shrinks in silence is indistinguishable from a store that emptied.
+
+  **The default runs one way only.** A payload with no `source`, an empty value, a spelling from a future release, or no stdin at all is left unrecognised and gets today's output unchanged. An absence read as `compact` would silently stop injecting memory for anyone whose payload shape differs from the one this heuristic was written against — the failure this plugin exists to prevent, not to cause.
+
+  **Nothing else narrows.** `startup`, `resume`, `clear` and `fork` are untouched, and so are `=== HANDOFF ===`, `=== LAST HANDOFF ===`, the history hint, the consolidation trigger and the `hooks.d/` dispatches, at every source. `fork` in particular is left at the full recap deliberately: what a fork inherits from its parent's context was not established, and an unverified belief is not grounds for withholding memory. Neither the recovery block nor the capture-gap check branches on `source` — #206 settled that by changing the shape of the evidence store, precisely because a source filter answers the wrong half of that question.
+
 ### Fixed
 
 - **The README version badge had read 0.8.3 for nine releases** ([#335](https://github.com/Digital-Process-Tools/claude-remember/issues/335)) — the release sweep greps for the *outgoing* version when cutting a new one, which finds every site mid-bump and none that stopped being bumped at all. Bumped to match `.claude-plugin/plugin.json` (0.18.0), and `tests/test_version_manifest.py::test_readme_version_badge_matches_code` now pins the badge to the manifest and fails loud if its own pattern stops matching, rather than passing on a badge it never found.
