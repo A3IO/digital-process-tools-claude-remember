@@ -366,6 +366,51 @@ debug_enabled() {
 REMEMBER_TZ=$(config ".timezone" "")
 export REMEMBER_TZ
 
+# What user-prompt-hook.sh is allowed to inject (#301). Read here rather than in
+# the hook because the hook's whole design is that it does NOT resolve config —
+# it replays an answer someone else already paid for (see lib-env-cache.sh).
+# `config` is table-backed by the time this line runs, so this is a lookup, not
+# a process: the same read REMEMBER_TZ above gets.
+#   full   — the line that has always shipped: [HH:MM TZ — user — 45%]
+#   stable — [user] only, plus the >=95 warning; no per-turn-volatile bytes
+#   off    — nothing at all, warning included
+# An unrecognised value is `full`: a typo must not silently delete the clock.
+REMEMBER_PROMPT_STAMP=$(config ".prompt_stamp" "full")
+case "$REMEMBER_PROMPT_STAMP" in
+    stable|off) ;;
+    *) REMEMBER_PROMPT_STAMP="full" ;;
+esac
+export REMEMBER_PROMPT_STAMP
+
+# The two numbers post-tool-hook.sh needs on every tool call (#350). Read here,
+# for the same reason REMEMBER_PROMPT_STAMP is: that hook now replays a
+# resolution rather than performing one, and `config()` is the one thing it
+# could not replay — which is exactly why #227 skipped it.
+#
+# What is cached is these two SCALARS, never the merged config file. That file
+# can carry `haiku.oauth_token`, which is why lib-memory-dir.sh creates it 0600
+# per PID under an EXIT trap (#68/#232); publishing it at a stable path to save
+# processes is a trade this repo has already declined once and is not making by
+# the back door. A save cooldown and a line threshold are neither secret nor
+# expensive to be wrong about for one prompt.
+#
+# Both are table-backed by the time these lines run, so they are parameter
+# expansions and not two more processes.
+#
+# Validated HERE rather than at each reader. Both end up inside `$(( ))` and
+# `[ -lt ]`, and this repo has taken the same lesson twice: garbage in
+# arithmetic under `set -u` does not misbehave, it kills the shell (#258), and
+# a leading zero that clears a digits-only guard is read as octal (#322/#332).
+# One validation at the source beats one per consumer, which is how the
+# pre-#158 duplicate readers drifted.
+REMEMBER_SAVE_COOLDOWN=$(config ".cooldowns.save_seconds" 120)
+case "$REMEMBER_SAVE_COOLDOWN" in ''|*[!0-9]*) REMEMBER_SAVE_COOLDOWN=120 ;; esac
+export REMEMBER_SAVE_COOLDOWN
+
+REMEMBER_DELTA_THRESHOLD=$(config ".thresholds.delta_lines_trigger" 50)
+case "$REMEMBER_DELTA_THRESHOLD" in ''|*[!0-9]*) REMEMBER_DELTA_THRESHOLD=50 ;; esac
+export REMEMBER_DELTA_THRESHOLD
+
 # Model + reject-gate knobs. config.json is the source of truth; an explicit
 # shell env var still wins (override) via ${VAR:=...}, then config, then the
 # built-in default. Exported here (log.sh is sourced by every script) so both
@@ -703,6 +748,24 @@ _dispatch_report_skip() {
     log "dispatch" "$_msg"
     [ -d "$REMEMBER_DIR/logs" ] || return 0
     printf '%s\n' "$(_remember_date +%H:%M:%S) [dispatch] $_msg" \
+        >> "$REMEMBER_DIR/logs/hook-errors.log" 2>/dev/null || true
+    return 0
+}
+
+# Report one thing that went wrong, in both places a human looks (#326).
+#
+# The generalisation of the two functions above, for callers that are not
+# dispatch. `log()` alone is not enough and #252 is the demonstration: the daily
+# narrative is not read, and `/remember:doctor` reports "Recent errors" out of
+# hook-errors.log, which is the file a reporter is asked to paste.
+#
+# Written by PATH rather than by inherited stderr, for the reason
+# _dispatch_report_failure gives: save-session.sh's stderr is the agent's own
+# stream, and a hook must never gain the ability to write into the session.
+report_error() {
+    log "$1" "$2"
+    [ -d "$REMEMBER_DIR/logs" ] || return 0
+    printf '%s\n' "$(_remember_date +%H:%M:%S) [$1] $2" \
         >> "$REMEMBER_DIR/logs/hook-errors.log" 2>/dev/null || true
     return 0
 }
@@ -1194,7 +1257,9 @@ rotate_logs() {
     local prev=0
     if [ -f "$state" ]; then read -r prev < "$state" 2>/dev/null || prev=0; fi
     case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
-    local streak=$((prev + 1))
+    # 10# after the case (#332) — an "08" here abandons the rest of this
+    # function, which is where the escalation ERROR is logged.
+    local streak=$((10#$prev + 1))
     printf '%s\n%s\n%s\n' "$streak" "$(date '+%Y-%m-%d %H:%M:%S')" "$first_line" \
         > "$state" 2>/dev/null || true
 

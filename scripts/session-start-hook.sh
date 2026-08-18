@@ -6,7 +6,8 @@
 # DESCRIPTION
 #   Runs at the beginning of every Claude Code session. Performs three jobs:
 #   1. Injects memory files (identity, core memories, today, now, recent,
-#      archive) into the session context via stdout.
+#      archive) into the session context via stdout. At source=compact only
+#      identity is injected and the rest are named — see #339, below.
 #   2. Recovers the most recent missed session by launching save-session.sh
 #      with --force in the background.
 #   3. Triggers background maintenance: consolidation of past-day staging
@@ -108,9 +109,11 @@ _remember_env_cache_publish
 #
 # #206 named the enabler and shipped the other half of the fix: this hook never
 # read its stdin, so it had neither `source` nor `session_id` and could not
-# exclude itself. Only `session_id` is needed. Excluding our own transcript by
-# id is correct at EVERY source, so there is no source list to enumerate and
-# nothing that was being reported stops being reported.
+# exclude itself. Only `session_id` is needed for THAT job: excluding our own
+# transcript by id is correct at EVERY source, so there is no source list to
+# enumerate and nothing that was being reported stops being reported. `source`
+# is read too, since #339, but for a different job entirely — how much of the
+# memory recap to print — and nothing on this path consults it.
 #
 # Reading stdin is only safe if it cannot wait forever, so this takes both
 # guards post-tool-hook.sh documents: a tty stdin (hand invocation from a
@@ -131,18 +134,27 @@ fi
 # same reason: the key must be followed by nothing but whitespace and a colon
 # before the value's opening quote, so a `session_id` appearing inside some
 # other field is not mistaken for the field. It is a heuristic and is treated
-# as one — the result is validated as a path component below before anything
-# is done with it.
-_stdin_session_id() {
-    local raw="$1" rest prefix value
-    case "$raw" in *'"session_id"'*) ;; *) return 1 ;; esac
-    rest=${raw#*\"session_id\"}
+# as one — every result is validated below before anything is done with it.
+#
+# Taken over the key rather than hard-coded, because #339 needs a second field
+# — `source` — out of the same payload, and one heuristic is easier to reason
+# about than two copies of it. post-tool-hook.sh keeps its own single-key
+# copy: it reads one field, and sourcing a shared library from a hook that has
+# to survive a broken install is a worse trade than ten duplicated lines.
+_stdin_json_string() {
+    local key="$1" raw="$2" rest prefix value
+    case "$raw" in *"\"$key\""*) ;; *) return 1 ;; esac
+    rest=${raw#*\"$key\"}
     prefix=${rest%%\"*}
     case "$prefix" in *[!:[:space:]]*) return 1 ;; esac
     value=${rest#*\"}
     value=${value%%\"*}
     [ -n "$value" ] || return 1
     printf '%s' "$value"
+}
+
+_stdin_session_id() {
+    _stdin_json_string session_id "$1"
 }
 
 CURRENT_SESSION_ID=$(_stdin_session_id "$HOOK_STDIN" 2>/dev/null) || CURRENT_SESSION_ID=""
@@ -152,6 +164,26 @@ CURRENT_SESSION_ID=$(_stdin_session_id "$HOOK_STDIN" 2>/dev/null) || CURRENT_SES
 # the basename-derived ids face — at the point of entry, not the point of use.
 case "$CURRENT_SESSION_ID" in
     ''|.|..|*[!A-Za-z0-9._-]*) CURRENT_SESSION_ID="" ;;
+esac
+
+# ── Which KIND of SessionStart is this? (#339) ────────────────────────────
+# `source` is one of startup | resume | clear | compact | fork. It is read for
+# exactly one decision — how much of the memory recap to print — and nothing
+# else in this script branches on it. In particular the recovery block and the
+# capture-gap check below deliberately do NOT: #206 settled that question by
+# changing the shape of the evidence store, precisely because a source filter
+# answers the wrong half of it.
+#
+# Read strictly, and in one direction only. A payload with no `source`, an
+# empty value, a spelling from a future release, or no stdin at all leaves
+# this empty and takes the unchanged path. An absence must never be read as
+# `compact`: that would silently stop injecting memory for anyone whose
+# payload shape differs from the one this heuristic was written against —
+# the failure this plugin exists to prevent, not to cause.
+SESSION_START_SOURCE=$(_stdin_json_string source "$HOOK_STDIN" 2>/dev/null) || SESSION_START_SOURCE=""
+case "$SESSION_START_SOURCE" in
+    startup|resume|clear|compact|fork) ;;
+    *) SESSION_START_SOURCE="" ;;
 esac
 
 # ── Publish the consumed payload to hooks.d/ ──────────────────────────────
@@ -327,6 +359,229 @@ _remember_write_slug_record() {
     return 0
 }
 _remember_write_slug_record
+
+# ── And somewhere a caller can NAME, in the layout we ship (#297) ─────────
+# The record above answers "what is the slug", and in the layout
+# config.user.example.json ships — "data_dir": "~/.remember/{slug}", under a
+# _purpose that says to copy it — it answers from inside a directory the slug
+# names. A caller holding project_dir and the template could not open it
+# without already knowing what it says. That was written down as one documented
+# hole when #296 shipped; it is the recommended configuration, and those are
+# the installs most likely to have a non-bash caller in the first place.
+#
+# NOTHING IS DERIVED FROM project_dir. The alternative shape — a second copy at
+# <store_root>/tmp/session-slug-<key from project_dir> — needs a key both sides
+# compute the same way, which is a second algorithm over the project path, and
+# deleting exactly that is what #294 and #296 were for. A language-neutral
+# encoding does not escape it either: base64 of an N-byte path is 4*ceil(N/3),
+# so the 260-character paths #294 was about come out at 348 bytes and the
+# 300-character vector in tests/slug_vectors.py at 400, past the 255-byte
+# filename limit everywhere — and truncating to fit means appending a hash, a
+# slug algorithm under a different name. An index matched on project_dir
+# verbatim asks the caller to compute nothing at all, and keeps the property
+# the reporter's own directory scan has: it cannot answer wrongly, only fail
+# to answer.
+#
+# WRITTEN ONLY WHEN THE SLUG NAMES THE STORE. REMEMBER_STORE_ROOT is empty in
+# the legacy layout and in a single-directory external store, where it would
+# equal REMEMBER_DIR and duplicate a record that is already reachable — two
+# files saying one thing, with a second chance to disagree. The common layout
+# pays nothing for the external one, which is also why this is not in
+# bootstrap-dirs.sh.
+#
+# ONE FILE, MANY WRITERS — the difference from the record, which each project
+# owns outright. Several projects, and several worktrees of one project, start
+# sessions against one store root, and a read-modify-write across them loses
+# rows silently. So the rewrite is taken under the plugin's one lock primitive
+# and published with mv; a session that cannot take the lock writes no row and
+# says nothing, because the per-project record remains authoritative and this
+# is a way to find it, not a second source of truth.
+#
+# NO TIMESTAMPS, for the reason _remember_write_slug_record gives above. A row
+# for a directory since deleted can never be MATCHED by a caller holding a live
+# project_dir, and if that path is ever recreated the row is still correct — so
+# rows are never expired by age, and never pruned by testing whether the
+# directory still exists, which would drop correct rows for anything on an
+# unmounted share. The only bound is the row cap, and the ordering it drops by
+# is position, maintained by this rewrite. That is not a staleness test and no
+# reader may use it as one.
+#
+# AND NO ROW AT ALL for a project_dir this file cannot hold. A newline is legal
+# on POSIX and a tab is legal too, and both are structure here. The record can
+# take status=unavailable for that case; a row cannot, because it would have to
+# be keyed by the very value it is refusing. A caller with such a path finds no
+# row and falls back — the same outcome as this never having run, which is the
+# honest one.
+SLUG_INDEX_LOCK_TIMEOUT=2
+SLUG_INDEX_MAX_ROWS=1000
+_remember_write_slug_index() {
+    [ -n "${REMEMBER_STORE_ROOT:-}" ] || return 0
+    [ "$REMEMBER_STORE_ROOT" != "$REMEMBER_DIR" ] || return 0
+    [ -n "$PROJECT_PATH_SLUG" ] || return 0
+
+    case "${PROJECT}${REMEMBER_DIR}" in
+        *$'\n'*|*$'\t'*) return 0 ;;
+    esac
+
+    local _dir="$REMEMBER_STORE_ROOT/tmp"
+    [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || return 0
+
+    local _index="$_dir/sessions" _lock="$_dir/sessions.lock" _tmp
+
+    # Sourced here rather than at the top of the file: this is the only caller,
+    # and lib-lock.sh probes for fractional sleep at source time — a fork the
+    # legacy layout has no reason to pay at every session start.
+    source "$_HOOK_DIR/lib-lock.sh" 2>/dev/null || return 0
+    command -v lock_acquire >/dev/null 2>&1 || return 0
+    lock_acquire "$_lock" "$SLUG_INDEX_LOCK_TIMEOUT" || return 0
+
+    _tmp="$_index.$$"
+    {
+        printf 'format=1\n'
+        if [ -f "$_index" ]; then
+            # Our own row dropped — it is re-appended below, so a project that
+            # starts twice moves rather than doubles — and the oldest dropped at
+            # the cap. A first line that is not ours means a format this version
+            # cannot read: exit, print nothing, start the file over, rather than
+            # carry rows forward under rules we do not know.
+            awk -v self="$PROJECT" -v max="$((SLUG_INDEX_MAX_ROWS - 1))" '
+                NR == 1 { if ($0 != "format=1") exit 0; next }
+                $0 == "" { next }
+                {
+                    n = index($0, "\tproject_dir=")
+                    if (n == 0) next
+                    if (substr($0, n + 13) == self) next
+                    rows[++c] = $0
+                }
+                END {
+                    start = (c > max) ? c - max + 1 : 1
+                    for (i = start; i <= c; i++) print rows[i]
+                }
+            ' "$_index" 2>/dev/null
+        fi
+        # project_dir LAST, and the only field whose value may contain a tab —
+        # so a reader splits on the first three and keeps the remainder whole.
+        # slug is ASCII by construction, and memory_dir was refused above if it
+        # carried one.
+        printf 'status=ok\tslug=%s\tmemory_dir=%s\tproject_dir=%s\n' \
+            "$PROJECT_PATH_SLUG" "$REMEMBER_DIR" "$PROJECT"
+    } > "$_tmp" 2>/dev/null || {
+        rm -f "$_tmp" 2>/dev/null
+        lock_release "$_lock" 2>/dev/null
+        return 0
+    }
+
+    mv -f "$_tmp" "$_index" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
+    lock_release "$_lock" 2>/dev/null
+    return 0
+}
+_remember_write_slug_index
+
+# ── Is this store known by a second spelling? (#298) ──────────────────────
+# Git's index is case-sensitive where NTFS is not, so a store can be spelled
+# one way on disk and another in the repository that backs it up. That costs
+# nothing while it stays on a case-insensitive filesystem — measured on the
+# reporter's own Windows box, where both spellings resolve to the same
+# directory object — and it splits the store in two on a case-sensitive
+# restore, which is the machine least likely to be looking.
+#
+# Session start, not the per-tool-call path: `session_dir_slug` runs on every
+# tool call and #299 pinned that path byte-identical. The whole check costs one
+# `git ls-tree` and only for a store that has its own repository; the disk half
+# costs no fork at all, and a store in the legacy layout pays nothing because
+# the library returns not-applicable before either probe runs.
+#
+# Disclosure only, and everything downstream keys off ONE fact: whether the
+# finding has changed since last session. The record at tmp/case-divergence
+# always holds the current answer in all four states, and is rewritten only
+# when that answer is different — which is also what makes the steady state
+# fork-free. The human-facing notice and the "could not check" log line fire
+# on that same change. The condition never clears itself and is harmless
+# today, so repeating it every session start would spend the one channel a
+# human actually reads (#200) on wallpaper — the argument `_push_and_report`
+# makes for its threshold, with the threshold replaced by "say it again only
+# when it says something different". `/remember:doctor` re-runs the check live
+# and reports every time, which is where someone who suspects a problem looks.
+_remember_write_case_divergence() {
+    source "$_HOOK_DIR/lib-case-divergence.sh" 2>/dev/null || return 0
+    command -v remember_case_divergence >/dev/null 2>&1 || return 0
+    remember_case_divergence
+
+    local _dir="$REMEMBER_DIR/tmp" _tmp _old="" _body="" NL=$'\n'
+
+    # The record built as a string first, so it can be compared with what is
+    # already on disk. Every field is appended unconditionally or inside an
+    # `if` — never `[ -n … ] && …`, which as a group's last command makes a
+    # correct write look like a failed one, and cost this file a record it had
+    # already produced until the trace said so.
+    _body="format=1${NL}status=$REMEMBER_CASE_STATUS"
+    if [ "$REMEMBER_CASE_STATUS" != "not-applicable" ]; then
+        _body="$_body${NL}resolved=$REMEMBER_CASE_RESOLVED"
+        _body="$_body${NL}store_root=$REMEMBER_CASE_ROOT"
+        _body="$_body${NL}disk_state=$REMEMBER_CASE_DISK_STATE"
+        if [ -n "$REMEMBER_CASE_DISK_REASON" ]; then
+            _body="$_body${NL}disk_reason=$REMEMBER_CASE_DISK_REASON"
+        fi
+        if [ -n "$REMEMBER_CASE_DISK_NAMES" ]; then
+            _body="$_body${NL}disk_names=$REMEMBER_CASE_DISK_NAMES"
+        fi
+        _body="$_body${NL}git_state=$REMEMBER_CASE_GIT_STATE"
+        if [ -n "$REMEMBER_CASE_GIT_REASON" ]; then
+            _body="$_body${NL}git_reason=$REMEMBER_CASE_GIT_REASON"
+        fi
+        if [ -n "$REMEMBER_CASE_GIT_NAMES" ]; then
+            _body="$_body${NL}git_names=$REMEMBER_CASE_GIT_NAMES"
+        fi
+    fi
+
+    # Read what is already there BEFORE deciding anything: it answers both
+    # "has the finding changed" (which is what the human-facing notice fires
+    # on) and "is there anything to write at all". Read with the shell — a
+    # `grep | tr` here was two forks on a path whose whole budget is one
+    # `git ls-tree`, and in the legacy layout, where this check is
+    # not-applicable and its record never changes, it was two forks for a file
+    # that already said the right thing.
+    if [ -f "$_dir/case-divergence" ]; then
+        local _pline
+        while IFS= read -r _pline; do
+            _old="${_old:+$_old$NL}$_pline"
+        done < "$_dir/case-divergence"
+    fi
+
+    if [ "$_old" != "$_body" ]; then
+        [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || return 0
+        _tmp="$_dir/case-divergence.$$"
+        printf '%s\n' "$_body" > "$_tmp" 2>/dev/null \
+            || { rm -f "$_tmp" 2>/dev/null; return 0; }
+        mv -f "$_tmp" "$_dir/case-divergence" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
+    fi
+
+    case "$REMEMBER_CASE_STATUS" in
+        diverged)
+            log "case-divergence" "$REMEMBER_CASE_MESSAGE"
+            # An unchanged record is an unchanged finding, and the human has
+            # already been told. Saying it again every session start would
+            # spend the one channel they actually read on a condition that is
+            # harmless today and never clears itself.
+            [ "$_old" = "$_body" ] && return 0
+            printf '%s\n' "$REMEMBER_CASE_MESSAGE" \
+                > "$_dir/case-divergence-notice" 2>/dev/null || true
+            ;;
+        unavailable)
+            # Logged on change only. The commonest reason by far is
+            # `not-a-repository` — an external store nobody has pointed a git
+            # backup at — and that is a standing condition, not an event: one
+            # identical line per session for the life of the install is the
+            # wallpaper #252's five weeks of identical daily lines proved
+            # nobody reads. It is still never rendered as agreement anywhere
+            # that reports it; `/remember:doctor` says it every time.
+            [ "$_old" = "$_body" ] && return 0
+            log "case-divergence" "could not check whether this store is known by a second spelling (disk=$REMEMBER_CASE_DISK_STATE${REMEMBER_CASE_DISK_REASON:+/$REMEMBER_CASE_DISK_REASON} git=$REMEMBER_CASE_GIT_STATE${REMEMBER_CASE_GIT_REASON:+/$REMEMBER_CASE_GIT_REASON}) — this is not a report that they agree"
+            ;;
+    esac
+    return 0
+}
+_remember_write_case_divergence
 
 # Args: $1 — sessions dir. Prints the newest transcript that is not this
 # session's, or nothing.
@@ -649,7 +904,10 @@ if [ -f "$REMEMBER_HANDOFF" ] && [ -s "$REMEMBER_HANDOFF" ]; then
 
     echo "=== LAST HANDOFF ==="
     if [ -n "$PREV_FP" ] && [ "$HANDOFF_FP" = "$PREV_FP" ]; then
-        DELIVERIES=$((DELIVERIES + 1))
+        # 10# after the case (#332). The record is explicitly hand-editable,
+        # which is the premise of the guard above and the one source that can
+        # deliver "08".
+        DELIVERIES=$((10#$DELIVERIES + 1))
         echo "[already delivered ${DELIVERIES} times since ${FIRST_DELIVERED:-an earlier session} — no new handoff has been written since, so this is pending replacement, not news. You may already have acted on it. Running /remember replaces it.]"
     else
         DELIVERIES=1
@@ -672,8 +930,13 @@ cat "$PLUGIN_ROOT/prompts/session-history-hint.txt" 2>/dev/null
 echo ""
 
 # ── Inject memory into context ────────────────────────────────────────────
+# One list, read three times below — the membership test, the injection loop
+# and the named-only loop. Kept in a single place so a seventh memory file
+# cannot be added to one of them and forgotten by the others.
+MEMORY_FILES=("$IDENTITY_FILE" "$CORE_MEMORIES" "$REMEMBER_TODAY_FILE" "$REMEMBER_NOW" "$REMEMBER_RECENT" "$REMEMBER_ARCHIVE")
+
 HAS_MEMORY=""
-for MFILE in "$IDENTITY_FILE" "$CORE_MEMORIES" "$REMEMBER_TODAY_FILE" "$REMEMBER_NOW" "$REMEMBER_RECENT" "$REMEMBER_ARCHIVE"; do
+for MFILE in "${MEMORY_FILES[@]}"; do
     if [ -f "$MFILE" ]; then
         HAS_MEMORY="true"
     fi
@@ -682,38 +945,106 @@ done
 # oversized archive and the fresh archive.md stays empty until the next
 # consolidation — and gating on the list above meant the whole section was
 # skipped, so the one state issue #124 is written to fix printed nothing at all.
-ROTATED_ARCHIVES=$(ls "$REMEMBER_DIR"/archive-*.md 2>/dev/null | sort)
-if [ -n "$ROTATED_ARCHIVES" ]; then
+#
+# Two families since #348, not one. A store whose recent.md is the over-cap
+# bulk now rotates it to recent-YYYY-MM-DD.md, and a glob that only knew
+# archive-*.md would leave that slice exactly as invisible as #124 found the
+# archives — the recovery would keep the bytes and lose the recall, which is
+# the failure #124 exists to name.
+ROTATED_SLICES=$(ls "$REMEMBER_DIR"/archive-*.md "$REMEMBER_DIR"/recent-*.md 2>/dev/null | sort)
+if [ -n "$ROTATED_SLICES" ]; then
     HAS_MEMORY="true"
 fi
 
 if [ -n "$HAS_MEMORY" ]; then
     echo "=== MEMORY ==="
-    for MFILE in "$IDENTITY_FILE" "$CORE_MEMORIES" "$REMEMBER_TODAY_FILE" "$REMEMBER_NOW" "$REMEMBER_RECENT" "$REMEMBER_ARCHIVE"; do
+    # At source=compact these bodies were already delivered — in this same
+    # session, to the context the compaction has just replaced with a summary
+    # of it. SessionStart fires again there, but the store has not changed and
+    # nothing about the recap is news.
+    #
+    # Identity is the exception and is still printed in full, because it works
+    # by PRESENCE: a path to identity.md does not make the agent behave as
+    # that persona, and no other line of this hook's output even names the
+    # file. Everything else is recall-on-demand and stays addressable — the
+    # === REMEMBER === hint above names the store's files on every single
+    # fire, and the block below names these ones again with their sizes.
+    #
+    # Named rather than dropped, which is the #124 vocabulary for "kept but
+    # not injected": a file nobody names is a file nobody greps, and a recap
+    # that shrinks in silence is indistinguishable from a store that emptied.
+    # The last defence, and the only one that helps a store that is ALREADY
+    # broken (#346). A memory file is written by consolidation, and a bounded
+    # writer does nothing for the 6.4 GB recent.md someone already has on
+    # disk: this loop cat'd it into every session, which is what froze every
+    # `claude` launch in that project and took the reporter's iTerm2 to ~56 GB.
+    #
+    # Named rather than injected, which is the #124 vocabulary a few lines
+    # below for rotated archives — the same trade, reached by size instead of
+    # by filename. The bytes stay on disk and stay greppable; what stops is
+    # pouring them into a context window that cannot hold them. A file this
+    # size is a broken store either way, and a session that starts and says so
+    # is worth more than one that hangs.
+    MEMORY_INJECT_MAX_BYTES=$(config ".thresholds.memory_inject_max_bytes" 200000)
+    case "$MEMORY_INJECT_MAX_BYTES" in (''|*[!0-9]*) MEMORY_INJECT_MAX_BYTES=200000 ;; esac
+    OVERSIZED_MEMORY=""
+    for MFILE in "${MEMORY_FILES[@]}"; do
         if [ -f "$MFILE" ] && [ -s "$MFILE" ]; then
+            if [ "$SESSION_START_SOURCE" = "compact" ] && [ "$MFILE" != "$IDENTITY_FILE" ]; then
+                continue
+            fi
+            MFILE_BYTES=$(wc -c < "$MFILE" | tr -d ' ')
+            case "$MFILE_BYTES" in (''|*[!0-9]*) MFILE_BYTES=0 ;; esac
+            if [ "$MEMORY_INJECT_MAX_BYTES" -gt 0 ] && [ "$MFILE_BYTES" -gt "$MEMORY_INJECT_MAX_BYTES" ]; then
+                OVERSIZED_MEMORY="${OVERSIZED_MEMORY}${MFILE} (${MFILE_BYTES} bytes)
+"
+                continue
+            fi
             BASENAME=$(basename "$MFILE")
             echo "--- $BASENAME ---"
             cat "$MFILE"
             echo ""
         fi
     done
-    # ── Rotated archives: named, not injected (#124) ──────────────────────
+    if [ -n "$OVERSIZED_MEMORY" ]; then
+        echo "--- too large to inject (kept on disk; grep on request) ---"
+        printf '%s' "$OVERSIZED_MEMORY"
+        printf 'A healthy memory file is kilobytes. One this size means consolidation wrote a response nobody bounded (see thresholds.memory_inject_max_bytes) and has been skipping ever since; run /remember:doctor.\n'
+        echo ""
+    fi
+    if [ "$SESSION_START_SOURCE" = "compact" ]; then
+        # Built before the header is printed, so the header is never printed
+        # over an empty list — a store can hold identity.md and nothing else.
+        DEFERRED_MEMORY=$(for MFILE in "${MEMORY_FILES[@]}"; do
+            [ "$MFILE" != "$IDENTITY_FILE" ] || continue
+            [ -f "$MFILE" ] && [ -s "$MFILE" ] || continue
+            printf '%s (%s bytes)\n' "$MFILE" "$(wc -c < "$MFILE" | tr -d ' ')"
+        done)
+        if [ -n "$DEFERRED_MEMORY" ]; then
+            echo "--- not re-injected at compact (delivered at session start); read or grep on request ---"
+            printf '%s\n' "$DEFERRED_MEMORY"
+            echo ""
+        fi
+    fi
+    # ── Rotated slices: named, not injected (#124) ────────────────────────
     # An oversized archive.md is rotated to archive-YYYY-MM-DD.md and a fresh
-    # one started (#123). The bytes are kept, but nothing in the read path
-    # ever named them, so that slice of memory sat in cold storage no recall
-    # reached — "no memory lost" was true mechanically and false in practice.
+    # one started (#123); since #348 an oversized recent.md rotates the same
+    # way, to recent-YYYY-MM-DD.md. The bytes are kept, but nothing in the
+    # read path ever named them, so that slice of memory sat in cold storage
+    # no recall reached — "no memory lost" was true mechanically and false in
+    # practice.
     #
     # Named rather than cat'd on purpose: these files were rotated BECAUSE
     # they were too large to fit a prompt, so injecting them would rebuild
     # the problem rotation exists to solve. The agent greps them when a
     # question reaches past what is in context.
-    if [ -n "$ROTATED_ARCHIVES" ]; then
+    if [ -n "$ROTATED_SLICES" ]; then
         # Newest ROTATED_LIST_MAX by date, because rotations accumulate for the
         # life of a store and this prints on every single session start. The
         # glob is given for the rest so nothing becomes unreachable again —
         # which was the whole point of naming them.
         ROTATED_LIST_MAX=10
-        ROTATED_COUNT=$(echo "$ROTATED_ARCHIVES" | wc -l | tr -d ' ')
+        ROTATED_COUNT=$(echo "$ROTATED_SLICES" | wc -l | tr -d ' ')
         # Order by the date and rotation number IN THE NAME, parsed — not by
         # raw name, and not by mtime.
         #
@@ -731,10 +1062,17 @@ if [ -n "$HAS_MEMORY" ]; then
         # The name carries the truth: the date, then the rotation number, with
         # the un-suffixed file being that day's first. Zero-padding the number
         # makes the composed key sort correctly as plain text.
-        ROTATED_NEWEST=$(echo "$ROTATED_ARCHIVES" | while read -r _archive; do
-            [ -n "$_archive" ] || continue
-            _core=${_archive##*/}
+        #
+        # Both families (#348) go through one parse, keyed on the date and not
+        # on the family: archive-2026-06-29.md and recent-2026-06-29.md are
+        # two slices of the same week and belong next to each other in the
+        # listing. Only one of the two prefix strips can ever match a given
+        # name, so applying both is unconditional rather than a branch.
+        ROTATED_NEWEST=$(echo "$ROTATED_SLICES" | while read -r _slice; do
+            [ -n "$_slice" ] || continue
+            _core=${_slice##*/}
             _core=${_core#archive-}
+            _core=${_core#recent-}
             _core=${_core%.md}
             # Leading '(' on each pattern: bash 3.2 (still what macOS ships)
             # miscounts the parens of a case inside $( ) without it.
@@ -743,16 +1081,16 @@ if [ -n "$HAS_MEMORY" ]; then
                 (*)       _date=$_core;      _seq=1 ;;
             esac
             case "$_seq" in (''|*[!0-9]*) _seq=1 ;; esac
-            printf '%s-%010d\t%s\n' "$_date" "$_seq" "$_archive"
+            printf '%s-%010d\t%s\n' "$_date" "$_seq" "$_slice"
         done | sort | tail -n "$ROTATED_LIST_MAX" | cut -f2-)
-        echo "--- rotated archives (not shown; grep on request) ---"
-        echo "$ROTATED_NEWEST" | while read -r _archive; do
-            [ -f "$_archive" ] || continue
-            printf '%s (%s bytes)\n' "$_archive" "$(wc -c < "$_archive" | tr -d ' ')"
+        echo "--- rotated memory slices (not shown; grep on request) ---"
+        echo "$ROTATED_NEWEST" | while read -r _slice; do
+            [ -f "$_slice" ] || continue
+            printf '%s (%s bytes)\n' "$_slice" "$(wc -c < "$_slice" | tr -d ' ')"
         done
         if [ "$ROTATED_COUNT" -gt "$ROTATED_LIST_MAX" ]; then
-            printf '... and %s older: %s/archive-*.md\n' \
-                "$((ROTATED_COUNT - ROTATED_LIST_MAX))" "$REMEMBER_DIR"
+            printf '... and %s older: %s/archive-*.md, %s/recent-*.md\n' \
+                "$((ROTATED_COUNT - ROTATED_LIST_MAX))" "$REMEMBER_DIR" "$REMEMBER_DIR"
         fi
         echo ""
     fi

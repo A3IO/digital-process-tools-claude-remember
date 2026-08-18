@@ -440,12 +440,135 @@ _HOOK_ISOLATION_FLAG = "--setting-sources"
 # So isolation fails OPEN: it is dropped, loudly, and the memory record stays
 # protected by the echo guard in consolidate.py. That is why there are two
 # independent layers — this one can be degraded away, and the other cannot.
+#
+# The tuple is a list of spellings, and a list of spellings is never finished:
+# #316 was a Bedrock proxy install where stripping CLAUDE_CODE_USE_BEDROCK and
+# then declining to reload the `env` block left the child sending a proxy token
+# to the real API, which answers "401 Invalid bearer token" — the exact outage
+# this fallback exists for, in words none of the first four markers matched, so
+# capture failed 100% of the time and never retried. "failed to authenticate"
+# is the CLI's own prefix for that whole family; no rate limit or overload can
+# produce it, so it costs nothing and does not need a fifth issue to be filed.
 _AUTH_FAILURE_MARKERS = (
     "not logged in",
     "please run /login",
     "invalid api key",
+    "invalid bearer token",
     "authentication_error",
+    "failed to authenticate",
 )
+
+
+# The terminal record's fields that the CLI itself authors. This tuple is an
+# assumption about a schema, not a fact about one — it was cross-checked against
+# a measured CLI and against `_failure_detail`, which arrived at the same set
+# independently, and that is the whole of the evidence for it (#320). If the CLI
+# grows a new diagnostic field, everything below still runs and finds nothing,
+# which is why `_marker_missed_by_the_scan` exists: the set being wrong must not
+# be spelled the same way as there being nothing to find.
+_SCANNED_FAILURE_FIELDS = ("error", "result", "message")
+_SCANNED_FAILURE_LIST_FIELDS = ("errors",)
+
+
+def _failure_haystack(stdout: str, stderr: str) -> str:
+    """The text the *CLI itself* wrote about why it failed, lowercased.
+
+    Scanning all of stdout for a marker reads more than the CLI's own error.
+    Under `--output-format json` the CLI v2 array format carries assistant
+    message content in the same blob as the terminal result record, so a
+    conversation that merely *discusses* an auth failure — a dev debugging their
+    login — could put "not logged in" in front of a scan whose answer decides
+    whether the retry runs with the user's hooks live. That is the conversation
+    choosing when isolation is dropped, which is not a decision it may make.
+
+    So the scan reads the fields the CLI authors: `error` / `result` / `message`,
+    plus the `errors` list (`error_max_turns` populates only that one — measured:
+    it exits 1 and carries no `result` key at all), plus stderr.
+
+    **Unparseable or unrecognised stdout falls back to the raw scan**, and that
+    is deliberate rather than lazy. An older CLI, or a crash before any JSON is
+    emitted, has an auth failure to report and no structure to report it in;
+    refusing to look would fail *closed*, which is a permanent silent outage —
+    the #316 shape exactly. The fallback applies only when nothing structured was
+    found, so a payload that does explain itself is taken at its word.
+
+    **The field set is an assumption and cannot be widened here** (#320). A
+    terminal record that reports an auth failure in a field this does not read,
+    while a field it does read holds something benign, is scanned and found
+    clean — and the fallback cannot fire, because `authored` is non-empty.
+    Scanning the raw blob on that branch instead would restore the very
+    sensitivity to conversation content this docstring opens by rejecting. So
+    the caller reports that case rather than acting on it: see
+    `_marker_missed_by_the_scan`.
+    """
+    stdout = stdout or ""
+    stderr = stderr or ""
+
+    try:
+        payload = json.loads(stdout)
+    except ValueError:
+        return f"{stdout}\n{stderr}".lower()
+
+    if isinstance(payload, list):
+        payload = payload[-1] if payload else None
+
+    authored: list[str] = []
+    if isinstance(payload, dict):
+        for key in _SCANNED_FAILURE_FIELDS:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                value = value.get("message")
+            if isinstance(value, str) and value.strip():
+                authored.append(value)
+        for key in _SCANNED_FAILURE_LIST_FIELDS:
+            values = payload.get(key)
+            if isinstance(values, list):
+                authored.extend(e for e in values if isinstance(e, str))
+
+    if not authored:
+        return f"{stdout}\n{stderr}".lower()
+    return "\n".join(authored + [stderr]).lower()
+
+
+# The tokens that decide the un-isolated retry. Finding one of these outside the
+# scanned fields is the only case worth a line in the log: any other unscanned
+# text is, by construction, text this function was never going to act on.
+_DECIDING_TOKENS = _AUTH_FAILURE_MARKERS + ("unknown option",)
+
+
+def _marker_missed_by_the_scan(stdout: str, haystack: str) -> tuple[str, str] | None:
+    """A deciding token sitting in the terminal record, outside the scanned set.
+
+    Returns ``(token, field)`` or None. Reads **only** the terminal record — the
+    last element of the CLI v2 array, or the whole object — and only its
+    unrecognised keys. Deliberately not the conversation: assistant content is
+    what #318 removed from this decision, and a session that merely discusses an
+    auth failure would otherwise make this fire on every ordinary failure.
+
+    A token already present in ``haystack`` was scanned, so nothing was missed;
+    that also covers the raw-scan fallback, where the haystack is everything.
+    """
+    try:
+        payload = json.loads(stdout or "")
+    except ValueError:
+        return None
+    if isinstance(payload, list):
+        payload = payload[-1] if payload else None
+    if not isinstance(payload, dict):
+        return None
+
+    skip = set(_SCANNED_FAILURE_FIELDS) | set(_SCANNED_FAILURE_LIST_FIELDS)
+    for field, value in payload.items():
+        if field in skip:
+            continue
+        try:
+            text = json.dumps(value, default=str).lower()
+        except (TypeError, ValueError):
+            text = str(value).lower()
+        for token in _DECIDING_TOKENS:
+            if token in text and token not in haystack:
+                return token, field
+    return None
 
 
 def _isolation_may_be_the_cause(stdout: str, stderr: str) -> bool:
@@ -455,13 +578,35 @@ def _isolation_may_be_the_cause(stdout: str, stderr: str) -> bool:
     double a spend that already happened and hide the cause — the #129/#190
     shape, where a real failure was reported as costing nothing.
     """
-    haystack = f"{stdout or ''}\n{stderr or ''}".lower()
+    haystack = _failure_haystack(stdout, stderr)
     if "unknown option" in haystack:
         # Only ours. An unknown option naming some other flag says the CLI
         # disagrees about something we did not just add, and dropping this one
         # would not fix it.
         return _HOOK_ISOLATION_FLAG in haystack
-    return any(marker in haystack for marker in _AUTH_FAILURE_MARKERS)
+    if any(marker in haystack for marker in _AUTH_FAILURE_MARKERS):
+        return True
+
+    # Three states, not two. "No marker in the fields we read" and "the fields
+    # we read are the wrong ones" are different answers, and only the first is
+    # silence. The verdict below is unchanged either way: widening the scan on
+    # this branch would hand every non-auth failure back to the conversation,
+    # which is exactly what #318 closed. So this says so and declines.
+    missed = _marker_missed_by_the_scan(stdout, haystack)
+    if missed:
+        token, field = missed
+        _warn(
+            f"WARNING: this failure carries {token!r} in the terminal record's "
+            f"{field!r} field, which the marker scan does not read. It reads "
+            f"{', '.join(repr(f) for f in _SCANNED_FAILURE_FIELDS)}, the "
+            f"{_SCANNED_FAILURE_LIST_FIELDS[0]!r} list, and stderr (#318). NOT "
+            "retrying without hook isolation on the strength of an unrecognised "
+            "field — that decision may not be reachable from arbitrary content "
+            "(#202). If this is a genuine auth failure, capture is failing "
+            f"permanently and the fix is to add {field!r} to the scanned set: "
+            "please file it against #320."
+        )
+    return False
 
 
 def _build_cmd(tools: list[str] | None, isolate_hooks: bool) -> list[str]:

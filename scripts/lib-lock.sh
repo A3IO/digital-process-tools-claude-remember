@@ -12,11 +12,17 @@
 #   could each observe the same dead PID and each declare itself the new holder.
 #
 #   Measured on the old acquisition: 0/40 multi-winner rounds at N=2. At N=8 it
-#   is never zero — 11/40 in the harness on #182, 40/40 in the one in
-#   tests/test_lock_primitive.py, which holds the critical section for 0.1s so
-#   overlaps are certain to be observed. The rate depends on the harness; the
-#   point is only that it is zero at N=2 and not zero above it, which is why a
-#   two-process test proves nothing here — see #182.
+#   is never zero — 11/40 in the harness on #182, 40/40 in the one that was in
+#   tests/test_lock_primitive.py at the time, which held the critical section
+#   for 0.1s so overlaps were certain to be observed. The rate depends on the
+#   harness; the point is only that it is zero at N=2 and not zero above it,
+#   which is why a two-process test proves nothing here — see #182.
+#
+#   That harness counted winners. It no longer exists: counting acquisitions is
+#   not a measurement of mutual exclusion, because a contender scheduled after
+#   the holder released takes the free lock legitimately and is counted as a
+#   concurrent one (#293). The current tests record entry to and exit from the
+#   critical section in one ordered log and fail on overlap instead.
 #
 # Why takeover is `mv` and never `rm`:
 #
@@ -182,7 +188,8 @@ _lock_dir_age() {
         ''|*[!0-9]*) echo 0; return 0 ;;
     esac
     _now=$(date +%s)
-    echo $(( _now - _mtime ))
+    # 10# after the case, never instead of it (#332).
+    echo $(( _now - 10#$_mtime ))
 }
 
 # Adopt a lock directory that has no pid at all. A holder killed between
@@ -209,9 +216,17 @@ _lock_try_adopt() {
         # two shell instructions, so one that has sat untouched past the
         # threshold is debris by exactly the argument used for the lock itself.
         #
-        # `mv` rather than `rmdir` does the clearing, so that two adopters both
-        # judging the same marker dead cannot both proceed on it: a rename
-        # fails for everyone but the first.
+        # `mv` rather than `rmdir` does the clearing. Do NOT read that as the
+        # reason adoption is single-winner: `rmdir` is equally single-winner
+        # here — exactly one of N concurrent callers removes the directory and
+        # the rest get ENOENT — and mutating this line to it leaves every test
+        # in tests/test_lock_primitive.py green, correctly (#293). The gate is
+        # the `noclobber` pid write below, as the comment on it says: mutated
+        # even to `rm -rf`, which really does succeed for every caller, 8-way
+        # contention over 60 rounds still gives 0 doubled adoptions and 60/60
+        # rounds won. What `mv` buys is only that it clears a marker directory
+        # that is not empty, where `rmdir` would fail and wedge the lock it
+        # exists to unwedge.
         [ "$(_lock_dir_age "${_dir}/adopt")" -lt "$_LOCK_ADOPT_AFTER" ] && return 1
         mv "${_dir}/adopt" "${_dir}/adopt.dead.$$" 2>/dev/null || return 1
         rm -rf "${_dir}/adopt.dead.$$" 2>/dev/null || true
@@ -395,7 +410,7 @@ _lock_timing_us_to_ms() {
     esac
     # Truncation, never rounding: a hold must not come back longer than it was.
     _f="${_f}000"
-    _LOCK_TIMING_NOW=$(( _s * 1000 + 10#${_f:0:3} ))
+    _LOCK_TIMING_NOW=$(( 10#$_s * 1000 + 10#${_f:0:3} ))
     return 0
 }
 
@@ -404,7 +419,7 @@ _lock_timing_ns_to_ms() {
     case "$1" in
         ''|*[!0-9]*) _LOCK_TIMING_NOW=0; return 0 ;;
     esac
-    _LOCK_TIMING_NOW=$(( $1 / 1000000 ))
+    _LOCK_TIMING_NOW=$(( 10#$1 / 1000000 ))
     return 0
 }
 
@@ -413,7 +428,7 @@ _lock_timing_s_to_ms() {
     case "$1" in
         ''|*[!0-9]*) _LOCK_TIMING_NOW=0; return 0 ;;
     esac
-    _LOCK_TIMING_NOW=$(( $1 * 1000 ))
+    _LOCK_TIMING_NOW=$(( 10#$1 * 1000 ))
     return 0
 }
 
@@ -456,8 +471,23 @@ _lock_timing_disclose() {
         return 0
     fi
     _LOCK_TIMING_DISCLOSED=1
-    if command -v log >/dev/null 2>&1; then
-        log "lock-timing" "$1"
+    # `declare -F`, not `command -v`: the question is whether the CALLER SOURCED
+    # log.sh, and `command -v log` does not ask it. macOS ships /usr/bin/log —
+    # the system logging binary — so on the platform lib-lock.sh exists for that
+    # test is true on every machine, sourced or not. The branch then ran
+    # `/usr/bin/log lock-timing "..."`, which exits 64 on an unknown subcommand,
+    # and under `set -e` that aborts the caller MID-SAVE with save.lock held. In
+    # this repo every real sourcer takes log.sh first, so a function shadowed the
+    # binary and it never fired; it was one new caller away from firing, and the
+    # one path it can take down is the recorder's own way of saying it recorded
+    # nothing. An instrument whose failure notice is the failure is worse than a
+    # silent one. `declare -F` is a bash builtin, true only for a shell function,
+    # and works on bash 3.2.
+    if declare -F log >/dev/null 2>&1; then
+        # log() ends in `|| echo ... >&2` so it cannot fail, but this function is
+        # the last thing that may take a save down, and `set -e` does not care
+        # what the callee is supposed to do.
+        log "lock-timing" "$1" || printf 'remember lock-timing: %s\n' "$1" >&2
     else
         printf 'remember lock-timing: %s\n' "$1" >&2
     fi
