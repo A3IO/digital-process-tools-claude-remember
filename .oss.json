@@ -8,7 +8,7 @@
     "CHANGELOG.md",
     "README.md"
   ],
-  "changelog_dir": null,
+  "changelog_dir": "changelog.d",
   "docs_targets": [
     "README.md"
   ],

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-18 — A store that could not get out of its own way
+
+### Added
+
+- Maintainer furniture from the `oss` plugin: `CLAUDE.md`, a `changelog.d/` fragment
+  directory with a CI gate that every pull request now carries a fragment or the
+  `no-changelog` label, and the vendored assembler in `.oss/` that folds fragments into
+  `CHANGELOG.md` at release time (#351).
+- `CHANGELOG.md` now has a link-reference table, so each `## [x.y.z]` heading links to
+  its release instead of rendering as literal bracketed text (#351).
+
 ### Changed
 
 - **`PostToolUse` no longer re-derives, on every tool call, what a previous hook already resolved** ([#350](https://github.com/Digital-Process-Tools/claude-remember/issues/350)) — `post-tool-hook.sh` registers with **no matcher**, so it runs after every single tool call and the agent waits for it. Each invocation sourced `resolve-paths.sh` → `detect-tools.sh` → `bootstrap-dirs.sh` → `log.sh` unconditionally: a `git rev-parse`, a slug, a three-layer config merge and a one-pass flatten, plus a `python3 -V` spent only to validate an interpreter. The reporter measured **750-1000 ms per tool call** on Windows 11 / Git Bash, against ~90 ms for `user-prompt-hook.sh` on the same machine — the hook that already replays.
@@ -28,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **The `#200` wiring marker survives a store with no `tmp/`.** `bootstrap-dirs.sh` is what creates `$REMEMBER_DIR/tmp`, and the fast path does not source it. `tmp/post-tool-ran` is how `/remember:doctor` answers "is `PostToolUse` wired at all", so it now creates the directory on the failing write rather than assuming one — silently skipping it would tell users a wired hook had never fired, which is the exact regression #200 fixed.
 
 - **Two spawn-budget tests were measuring a path they did not name.** `tests/test_post_tool_hook_spawns.py` counted a *second* run of the same fixture, which after this change is the warm one — and whether it was warm at all depended on which side of a whole second the config write and the cache landed on ([#303](https://github.com/Digital-Process-Tools/claude-remember/issues/303)). It now pins `REMEMBER_ENV_CACHE=0` and states that it is the cold-path file; the warm path is measured next door. `TestFreshProjectBootstrap::test_detect_before_bootstrap` compared the first *mention* of two filenames anywhere in a hook, comments included, and now reads the `source` statements — with the premise ("both are in fact sourced") asserted instead of assumed.
+
+### Fixed
+
+- **A store already over the consolidation cap was never recovered — it just skipped, forever** ([#348](https://github.com/Digital-Process-Tools/claude-remember/issues/348)) — [#347](https://github.com/Digital-Process-Tools/claude-remember/pull/347) stopped a store *getting* into that state and stopped an oversized file freezing the session. It did not get anybody *out* of it, and the reporter of [#346](https://github.com/Digital-Process-Tools/claude-remember/issues/346) was already in it. Their only recovery was `mv state/recent.md state/recent.md.bak && touch state/recent.md`, which discards every byte of history — not an acceptable answer from a plugin whose whole job is not losing memory.
+
+  **`_rotate_archive` was the only escape hatch in the tree and it only ever touched `archive.md`.** Once `recent.md` alone exceeded `thresholds.consolidate_max_bytes` (default 600000), every round sized the store, found it over, and skipped. Nothing shrank it. The staging `today-*.md` files never retired either, because retirement happens after a *successful* round, so they accumulated for as long as the condition lasted.
+
+  **`recent.md` now rotates the same way `archive.md` has since [#123](https://github.com/Digital-Process-Tools/claude-remember/issues/123)** — to a dated sibling, `recent-YYYY-MM-DD.md`, with a `-2` suffix on a same-day repeat, a fresh empty file started, and consolidation resuming on the next round. Nothing is deleted. The bytes stay on disk, stay greppable, and are named at session start, which is the "kept but not injected" trade [#124](https://github.com/Digital-Process-Tools/claude-remember/issues/124) made for rotated archives — the session-start glob and the history hint both learned the second family, because a recovery that keeps the bytes and loses the recall is the failure #124 exists to name.
+
+  **Which file moves is arithmetic, and that decision is the change.** "The store is over the cap" is not the same question as "which file is why". If the sum is over because staging is enormous and `recent.md` is 40 KB, rotating `recent.md` heals nothing, splits an unconsolidated span for no gain, and the next round skips identically. So the guard escalates only as far as it must: drop `archive.md` if that is enough (the existing move); otherwise, if the staging bytes alone would fit, drop `recent.md` too — and `archive.md` as well only if staging plus archive would still not fit, because a healthy archive is not collateral. If past-day staging is over the cap **on its own**, nothing is rotated at all and the round skips, which is the honest answer rather than a destructive no-op.
+
+  Two rotations can now happen in one round, so the undo discipline #347 established for the archive covers both: a round that does not go through — a model error, a decline, a spawn refusal, a retry that still will not fit — leaves neither file moved. A half-undone pair would split the store across a name nothing consolidated.
+
+- **`/remember:doctor` had nothing to say about an oversized store** ([#348](https://github.com/Digital-Process-Tools/claude-remember/issues/348)) — the session-start notice added in #347 tells the user to run it, and the report answered with one line summing every memory file's bytes and moved on. A remedy pointing at a diagnostic that is silent about the condition is worse than no pointer: the user follows it, reads a clean report, and concludes the notice was noise. It now measures the same three parts against the same cap the pipeline enforces and reports the sum with its breakdown. The self-healing shape is a `WARN` whose remediation is *do nothing* and the verdict line is deliberately left alone, since capture is unaffected; the shape rotation cannot fix — past-day staging over the cap on its own — is a `FAIL` and takes a verdict arm of its own, because nothing will clear it and "capture is working" above a store that has not consolidated in months is the report contradicting itself. A memory file that exists but cannot be read is now named rather than counted as zero, so a store nobody could measure stops reading as a store that measured clean.
 
 ## [0.20.0] — A cap that only pointed one way
 
@@ -1268,7 +1293,8 @@ Fixes [#9](https://github.com/Digital-Process-Tools/claude-remember/issues/9), a
 
 ## [0.1.0] — Initial release
 
-[Unreleased]: https://github.com/Digital-Process-Tools/claude-remember/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/Digital-Process-Tools/claude-remember/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/Digital-Process-Tools/claude-remember/releases/tag/v0.21.0
 [0.20.0]: https://github.com/Digital-Process-Tools/claude-remember/releases/tag/v0.20.0
 [0.19.0]: https://github.com/Digital-Process-Tools/claude-remember/releases/tag/v0.19.0
 [0.18.0]: https://github.com/Digital-Process-Tools/claude-remember/releases/tag/v0.18.0

@@ -9,6 +9,7 @@ identity.md
 .remember/
 
 # Local Claude Code state (machine scope, never shared)
+.claude/settings.json
 .claude/settings.local.json
 .claude/jit-context/.discovery/
 .max/
