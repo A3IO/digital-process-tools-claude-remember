@@ -338,6 +338,46 @@ for _sel in "$_SESSION_END_LOG_DIR"/session-end-*.log; do
     [ -f "$_sel" ] && _SESSION_END_FIRED=1 && break
 done
 
+# Quietness alone is not proof of a genuine SessionEnd failure (#392): a
+# transcript can go quiet because a session that ran here predates this
+# project ever having a remember store, in which case no SessionEnd hook was
+# ever registered to fire for it. REMEMBER_DIR's own mtime looked like the
+# earliest "remember became active here" signal doctor.sh could read without
+# new marker infrastructure, but it is NOT stable: save-session.sh writes
+# now.md via mktemp-in-REMEMBER_DIR + mv (see save-session.sh's own Step 6
+# comments), and both the mktemp and the mv update REMEMBER_DIR's own mtime,
+# not just now.md's — so on any project with ongoing captures it reads as
+# "time since the last save", not "time since install", reopening the exact
+# false-negative window this fix exists to close (measured: a genuinely
+# 2-day-old store with one ordinary save 5 minutes ago reads as installed 5
+# minutes ago). $REMEMBER_DIR/.gitignore is what this reads instead:
+# bootstrap-dirs.sh writes it exactly once, gated on
+# `[ -f "$REMEMBER_DIR/.gitignore" ] || …`, and unlike every other path under
+# REMEMBER_DIR it is never rewritten by ordinary hook activity.
+#
+# It is NOT permanently stable, though (caught in review): a legacy
+# (in-project) store that is later migrated to external mode and backed up
+# with git has this exact file deleted by
+# hooks.d/after_save/50-git-backup.sh's own cleanup of the migration
+# artifact ("removed per-slug .gitignore (legacy bootstrap artifact)") the
+# first time a backed-up save runs, and bootstrap-dirs.sh's write is gated on
+# the store being inside the project (`case "$REMEMBER_DIR" in
+# "$_mem_proj"/*)`), which is false once external, so it is never recreated.
+# From that point this baseline is permanently unavailable for that store —
+# the same practical limit EXTERNAL storage mode already has from the start
+# (bootstrap-dirs.sh never writes this file there either — "no gitignore to
+# write" — so the baseline never exists to begin with), reached here via
+# migration instead. Either way the arm below can only ever reach WARN, never
+# FAIL, for a store in that state, until a marker survives that cleanup too
+# (filed as a follow-up rather than fixed here: the fix touches
+# hooks.d/after_save/50-git-backup.sh, outside this arm's own file). That is
+# a known, documented gap, not a silently accepted one — the same "no
+# reliable precondition, so WARN is the honest answer" outcome the issue
+# itself sanctions. Absent or unreadable for any reason, no transcript can be
+# attributed to "after install", which is the safe default: fall through to
+# the third state below rather than guess.
+_STORE_INSTALL_AGE=$(_file_age_seconds "$REMEMBER_DIR/.gitignore")
+
 _SESSION_END_STATE="unknown"
 if [ "$_SESSION_END_FIRED" -eq 1 ]; then
     echo "OK   SessionEnd has fired at least once for this project ($_SESSION_END_LOG_DIR/session-end-*.log)"
@@ -345,27 +385,53 @@ if [ "$_SESSION_END_FIRED" -eq 1 ]; then
 elif [ -n "$_SESSION_DIR" ] && [ -d "$_SESSION_DIR" ]; then
     _SE_TRANSCRIPT_COUNT=0
     _SE_STALE_TRANSCRIPT_COUNT=0
+    _SE_UNREADABLE_COUNT=0
+    _SE_PREDATES_STORE_COUNT=0
     for _tf in "$_SESSION_DIR"/*.jsonl; do
         [ -f "$_tf" ] || continue
-        _SE_TRANSCRIPT_COUNT=$((_SE_TRANSCRIPT_COUNT + 1))
         _tf_age=$(_file_age_seconds "$_tf")
         case "$_tf_age" in
-            ''|*[!0-9]*) continue ;;
+            ''|*[!0-9]*)
+                # Found, but its age could not be read — the same third
+                # state this file already names for the PostToolUse marker
+                # above, not folded into either "counted" or "silently
+                # dropped" (#392, defect 2).
+                _SE_UNREADABLE_COUNT=$((_SE_UNREADABLE_COUNT + 1))
+                continue
+                ;;
         esac
+        if [ -z "$_STORE_INSTALL_AGE" ] || [ "$_tf_age" -gt "$_STORE_INSTALL_AGE" ]; then
+            # Quiet since before remember's own store existed for this
+            # project (or no baseline could be read at all) — this
+            # transcript's silence proves nothing about SessionEnd (#392).
+            _SE_PREDATES_STORE_COUNT=$((_SE_PREDATES_STORE_COUNT + 1))
+            continue
+        fi
+        _SE_TRANSCRIPT_COUNT=$((_SE_TRANSCRIPT_COUNT + 1))
         [ "$_tf_age" -gt 900 ] && _SE_STALE_TRANSCRIPT_COUNT=$((_SE_STALE_TRANSCRIPT_COUNT + 1))
     done
     if [ "$_SE_STALE_TRANSCRIPT_COUNT" -ge 1 ]; then
         echo "FAIL SessionEnd has never fired for this project (no $_SESSION_END_LOG_DIR/session-end-*.log),"
         echo "     though $_SE_STALE_TRANSCRIPT_COUNT prior session transcript(s) in $_SESSION_DIR"
-        echo "     have gone quiet for over 15 minutes — the last-chance flush is not"
-        echo "     running. See session-end-hook.sh's own header for the endings Claude"
-        echo "     Code does not document firing on."
+        echo "     have gone quiet for over 15 minutes since remember became active here —"
+        echo "     the last-chance flush is not running. See session-end-hook.sh's own"
+        echo "     header for the endings Claude Code does not document firing on."
         _SESSION_END_STATE="not-fired"
     else
         echo "WARN SessionEnd has not fired yet, and no prior session has demonstrably"
-        echo "     ended in this project ($_SE_TRANSCRIPT_COUNT transcript(s) in"
-        echo "     $_SESSION_DIR, none quiet long enough to call finished) — nothing has"
+        echo "     ended in this project since remember became active here"
+        echo "     ($_SE_TRANSCRIPT_COUNT transcript(s) in $_SESSION_DIR attributable to"
+        echo "     that window, none quiet long enough to call finished) — nothing has"
         echo "     had the chance to prove or disprove this yet."
+        if [ "$_SE_PREDATES_STORE_COUNT" -gt 0 ]; then
+            echo "     ($_SE_PREDATES_STORE_COUNT more transcript(s) predate this project's"
+            echo "     remember store — or no store baseline could be read — and cannot"
+            echo "     testify either way.)"
+        fi
+        if [ "$_SE_UNREADABLE_COUNT" -gt 0 ]; then
+            echo "     ($_SE_UNREADABLE_COUNT more transcript(s) whose age could not be read"
+            echo "     were excluded rather than counted.)"
+        fi
     fi
 else
     echo "WARN SessionEnd has not fired yet, and the session transcript directory is"
