@@ -11,9 +11,15 @@ over": whether Claude Code's own transcript for that session id still
 exists under $SESSIONS_DIR (the same directory session-start-hook.sh already
 reads via `previous_transcript`).
 
-Three states, tested here as three cases over one fixture shape:
-  - the session's transcript is gone -> its delivery record is pruned
+Four states, tested here as four cases over one fixture shape (a fourth,
+#393, joined the original three below):
+  - the session's transcript is gone AND its record is old enough to be
+    outside the #393 startup grace window -> its delivery record is pruned
     (the "must fire" case)
+  - the session's transcript is gone but its record is still inside that
+    grace window -> its delivery record survives (#393's own "must not
+    fire" case -- a session still starting up is indistinguishable from a
+    dead one on the transcript check alone)
   - the session's transcript still exists -> its delivery record survives
     (the paired "must not fire" case -- the positive control that a broken
     or over-eager sweep would fail)
@@ -41,6 +47,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SESSION_START_SCRIPT = REPO_ROOT / "scripts" / "session-start-hook.sh"
 
 from pipeline.slug import session_dir_slug as _slug
+
+# Mirrors the grace window scripts/session-start-hook.sh's #393 fix uses to
+# arbitrate the sweep -- see the comment beside GRACE_MIN there for why this
+# duration (reasoned, not measured against real Claude Code timing).
+_GRACE_MIN = 5
+
+
+def _age_record(record: Path, minutes: float) -> None:
+    """Backdate a record's mtime so the #393 grace-window check reads it as
+    old enough that "no transcript yet" can only mean "session is over" --
+    never a session still inside its own startup window."""
+    import time
+    old = time.time() - (minutes * 60)
+    os.utime(record, (old, old))
 
 
 def _sandbox(tmp_path: Path):
@@ -111,8 +131,9 @@ class TestStaleDeliveryRecordsArePruned:
 
     def test_record_for_a_session_with_no_transcript_is_pruned(self, tmp_path):
         """MUST FIRE: session AAA delivered once and left a record behind;
-        its transcript is gone (never existed, or was cleaned up elsewhere).
-        The next session start must remove AAA's stale record."""
+        its transcript is gone (never existed, or was cleaned up elsewhere),
+        and the record is old enough that #393's grace window no longer
+        applies. The next session start must remove AAA's stale record."""
         project, home, remember_dir, _sessions_dir = _sandbox(tmp_path)
 
         out_a = _session_start(project, home, "sess-aaa")
@@ -123,6 +144,9 @@ class TestStaleDeliveryRecordsArePruned:
         # genuine artifact the hook itself writes, not a hand-built stand-in.
         _session_start(project, home, "sess-aaa")
         assert record_a.exists(), "setup did not produce a delivery record"
+        # Past the #393 grace window -- old enough that "no transcript" can
+        # only mean the session is over, never that it is still starting up.
+        _age_record(record_a, _GRACE_MIN + 1)
 
         # sess-aaa's transcript never existed under sessions_dir -- simulates
         # a session that is over and gone. A different, unrelated session
@@ -130,8 +154,38 @@ class TestStaleDeliveryRecordsArePruned:
         _session_start(project, home, "sess-bbb")
 
         assert not record_a.exists(), (
-            "a delivery record for a session with no transcript on disk "
-            "survived a later session start -- this is the #373 leak"
+            "a delivery record for a session with no transcript on disk, "
+            "old enough to be outside the startup grace window, survived "
+            "a later session start -- this is the #373 leak"
+        )
+
+    def test_fresh_record_with_no_transcript_yet_survives(self, tmp_path):
+        """MUST NOT FIRE (#393 positive control): session AAA's record was
+        JUST written and its transcript does not exist yet -- indistinguish-
+        able, on the sweep's only signal, from a session that is over. A
+        different session (BBB) starts inside that same window. AAA's
+        record must survive: at source=startup Claude Code creates a
+        session's own transcript only AFTER this hook has already run, so a
+        record this young is not evidence the session is gone."""
+        project, home, remember_dir, _sessions_dir = _sandbox(tmp_path)
+
+        _session_start(project, home, "sess-aaa")
+        record_a = _seed_delivery_record(remember_dir, "sess-aaa")
+        _session_start(project, home, "sess-aaa")
+        assert record_a.exists(), "setup did not produce a delivery record"
+        # record_a's mtime is left exactly as the hook just wrote it --
+        # inside the grace window, deliberately not backdated.
+
+        # sess-aaa's transcript still does not exist -- the exact #393 shape:
+        # absent transcript, freshly-written record. A different session
+        # (BBB) starts inside the window.
+        _session_start(project, home, "sess-bbb")
+
+        assert record_a.exists(), (
+            "a delivery record younger than the #393 startup grace window "
+            "was pruned on the strength of an absent transcript alone -- "
+            "a live session starting up is indistinguishable from a dead "
+            "one on that signal, so this is the #393 race"
         )
 
     def test_record_for_a_session_whose_transcript_still_exists_survives(self, tmp_path):
@@ -207,6 +261,9 @@ class TestStaleDeliveryRecordsArePruned:
         record_a = _seed_delivery_record(remember_dir, "sess-aaa")
         _session_start(project, home, "sess-aaa")
         assert record_a.exists(), "setup did not produce a delivery record"
+        # Past the #393 grace window -- an old per_session-era leftover, not
+        # a session still inside its own startup.
+        _age_record(record_a, _GRACE_MIN + 1)
 
         # sess-aaa's transcript is gone, and the user has switched back to
         # single mode before the next session starts.
