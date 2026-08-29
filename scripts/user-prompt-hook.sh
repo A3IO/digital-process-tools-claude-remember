@@ -54,17 +54,19 @@ _HOOK_DIR="${BASH_SOURCE[0]%/*}"
 # under the summarizer's temp dir and injects into its context.
 [ -n "${REMEMBER_NESTED_SUMMARIZER:-}" ] && exit 0
 
-# --- REMEMBER_HOOK_CWD (#417) ---
+# --- REMEMBER_HOOK_CWD (#417, #444) ---
 # resolve-paths.sh falls back to this variable when CLAUDE_PROJECT_DIR is
-# unset (#411), but only session-start-hook.sh and session-end-hook.sh ever
-# set it -- each from its own stdin `cwd`, freshly validated on every run.
-# This hook has no stdin `cwd` of its own to offer and must not silently
-# inherit whatever the process environment happens to already hold (a value
-# a DIFFERENT session's SessionStart exported, on a host that reuses one
-# environment across hook invocations). Clearing it here is cheap and
-# unconditionally correct regardless of whether that reuse is possible on any
-# supported host: on the common path CLAUDE_PROJECT_DIR is already set and
-# this arm never runs anyway.
+# unset (#411). Cleared here first and unconditionally, before anything below
+# could set or inherit it -- the #417 leak this closes is a DIFFERENT
+# session's SessionStart-exported value surviving into a hook that has not
+# validated it, or (on a host that reuses one process environment across
+# invocations) a stale value this same hook wrote on a PREVIOUS run. This
+# hook now offers its own stdin `cwd` further down (#444, only on the slow
+# path below), but that read has to happen after this unset, never instead of
+# it, or the #417 leak reopens. Clearing it here is cheap and unconditionally
+# correct regardless of whether that reuse is possible on any supported host:
+# on the common path CLAUDE_PROJECT_DIR is already set and this arm never
+# runs anyway.
 unset REMEMBER_HOOK_CWD
 
 # --- REMEMBER_TRANSCRIPT_PATH (#424) ---
@@ -104,6 +106,60 @@ if _remember_env_cache_load && [ ! -d "$PIPELINE_DIR/hooks.d/after_user_prompt" 
 fi
 
 if [ "$_REMEMBER_FAST" = "0" ]; then
+    # --- REMEMBER_HOOK_CWD from stdin (#444) ---
+    # resolve-paths.sh's REMEMBER_HOOK_CWD fallback (#411) only ever gets a
+    # value from session-start-hook.sh and session-end-hook.sh, which is why
+    # a host that never sets CLAUDE_PROJECT_DIR (Codex, Gemini CLI) hits the
+    # FATAL below on this hook: the #417 unset above left it correct but with
+    # no legitimate source of its own. UserPromptSubmit carries `cwd` on its
+    # own stdin payload on all three hosts (#407's comparison table), so read
+    # it here -- ONLY on this slow path. The fast path above replays an
+    # already-resolved REMEMBER_DIR and never sources resolve-paths.sh at
+    # all, so it has nothing to feed this to; reading stdin there would be a
+    # brand new cost on the path #227 exists to keep cheap. This path already
+    # forks bootstrap-dirs.sh and log.sh below, once per project per config
+    # change (see the COST section above) -- one bounded stdin read here does
+    # not change that shape.
+    #
+    # Bounded in TIME only (`read -t 1`, never a tty), the same reasoning
+    # every other stdin-reading hook in this repo already carries: a blocking
+    # read here is not a slow prompt, it is a lost one (see the COST section
+    # above). bash 3.2 has no sub-second -t, hence 1.
+    _HOOK_STDIN=""
+    if [ ! -t 0 ]; then
+        _line=""
+        while IFS= read -r -t 1 _line || [ -n "$_line" ]; do
+            _HOOK_STDIN="$_HOOK_STDIN$_line"
+            _line=""
+        done
+    fi
+    # The same deliberately narrow extractor session-start-hook.sh uses: the
+    # key must be followed by nothing but whitespace and a colon before the
+    # value's opening quote, so a `cwd` appearing inside some other field
+    # (unlikely on this payload, but not this function's job to assume) is
+    # not mistaken for it.
+    _stdin_cwd() {
+        local raw="$1" rest prefix value
+        case "$raw" in *'"cwd"'*) ;; *) return 1 ;; esac
+        rest=${raw#*\"cwd\"}
+        prefix=${rest%%\"*}
+        case "$prefix" in *[!:[:space:]]*) return 1 ;; esac
+        value=${rest#*\"}
+        value=${value%%\"*}
+        [ -n "$value" ] || return 1
+        printf '%s' "$value"
+    }
+    # Validated the same way session-start-hook.sh validates its own copy:
+    # data from a host payload, at the point of entry. A project directory
+    # legitimately contains slashes and dots, so only an embedded newline or
+    # carriage return is rejected -- whether the value actually names a
+    # directory is decided in resolve-paths.sh, which falls back to the
+    # existing derivation when it does not.
+    REMEMBER_HOOK_CWD=$(_stdin_cwd "$_HOOK_STDIN" 2>/dev/null) || REMEMBER_HOOK_CWD=""
+    case "$REMEMBER_HOOK_CWD" in
+        *$'\n'*|*$'\r'*) REMEMBER_HOOK_CWD="" ;;
+    esac
+    export REMEMBER_HOOK_CWD
     # Opt into resolve-paths.sh's soft-failure mode — see the comment in
     # session-start-hook.sh. This hook must never block the agent, so a
     # resolution failure is a silent no-op, not a crash.
