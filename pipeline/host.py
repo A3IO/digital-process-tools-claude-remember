@@ -25,14 +25,19 @@ inventing a seam rather than recording one:
 - **Event names.** Bindings live in each host's own manifest, which is the file
   that has to name them anyway. A mapping table here would be read by nobody.
 - **The summarizer.** ``pipeline/haiku.py`` shells ``claude -p`` or
-  ``codex exec``, chosen by ``detect_host()`` (#460) -- two real providers now
-  exist, which was this docstring's own bar for extracting an abstraction. It
-  still is not here: each provider's auth model and output shape (Anthropic's
+  ``codex exec``, chosen by ``pipeline.haiku._choose_summarizer_provider()``
+  -- "auto" reads the TRANSCRIPT the host wrote (``transcript_path()`` below
+  plus ``pipeline.extract.sniff_file_envelope()``), not ``detect_host()``
+  (#465; ``detect_host()`` was the original #460 mechanism, but the env-var
+  signature it reads does not survive into the hook process that actually
+  runs the summarizer). Two real providers now exist, which was this
+  docstring's own bar for extracting an abstraction. A shared interface is
+  still not here: each provider's auth model and output shape (Anthropic's
   ``--output-format json`` vs. Codex's ``-o <file>``) stay different enough
-  that a shared interface would either leak one CLI's shape into the other or
-  hide a distinction ``pipeline/haiku.py`` actually needs, so the provider
-  dispatch lives beside the CLI calls it dispatches to, and only WHICH host is
-  running lives here.
+  that one would either leak one CLI's shape into the other or hide a
+  distinction ``pipeline/haiku.py`` actually needs, so the provider dispatch
+  lives beside the CLI calls it dispatches to, and only WHICH host is running
+  lives here.
 - **Path resolution in shell.** ``scripts/resolve-paths.sh`` runs before Python
   is worth starting and mirrors ``PLUGIN_ROOT_VARS`` by hand, the same way
   ``lib-slug.sh`` mirrors ``pipeline/slug.py``. ``test_host_shell_parity``
@@ -138,15 +143,25 @@ UNKNOWN = Host(name="unknown", plugin_root_vars=(), project_dir_vars=())
 # Codex sandbox.
 #
 # A third, explicit AMBIGUOUS state was considered instead of silently
-# picking one. It was rejected here because detect_host() has exactly one
-# consumer (pipeline.haiku._resolve_summarizer_provider) and that consumer's
-# own contract is already binary -- "codex under a detected Codex host,
-# claude everywhere else" -- so AMBIGUOUS would collapse into the same
-# "claude" branch as UNKNOWN with no behavioural difference from today's
-# registry-order answer; it would be a label nothing reads, not a decision
-# nothing else could reach. If a second consumer is ever added that needs to
-# treat "ambiguous" differently from "no signature at all", that is the
-# point to revisit this, not before.
+# picking one. It was rejected here because, at the time, detect_host() had
+# exactly one consumer (pipeline.haiku._choose_summarizer_provider) and that
+# consumer's own contract was already binary -- "codex under a detected
+# Codex host, claude everywhere else" -- so AMBIGUOUS would have collapsed
+# into the same "claude" branch as UNKNOWN with no behavioural difference
+# from today's registry-order answer; it would have been a label nothing
+# reads, not a decision nothing else could reach.
+#
+# #465: that consumer no longer calls detect_host() at all -- the env-var
+# signature this function reads does not survive into the process that
+# actually runs the summarizer (see pipeline/haiku.py's own note on
+# _choose_summarizer_provider), so summarizer routing now reads the
+# transcript the host wrote instead. detect_host() stays here as a correct,
+# directly-tested fact about a process's environment
+# (tests/test_codex_signature_463.py) and the tie-break comment above still
+# describes real, still-true behaviour of THIS function; it is simply no
+# longer wired to the one decision it used to gate. If a consumer that needs
+# env-based host identification is ever added back, this is the point to
+# revisit AMBIGUOUS, not before.
 REGISTRY: tuple[Host, ...] = (CLAUDE_CODE, CODEX)
 
 # Every plugin-root variable any known host uses, in registry precedence order,
