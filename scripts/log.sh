@@ -75,7 +75,9 @@ fi
 # parameter expansion. Nothing is written to disk. That is the whole reason
 # this was preferred over caching the merged file at a stable path: that file
 # can carry `haiku.oauth_token`, a live OAuth credential, which is why
-# lib-memory-dir.sh creates it 0600 per PID under an EXIT trap (#68). Collapsing
+# lib-memory-dir.sh creates it 0600, fresh every invocation, under an EXIT
+# trap (#68/#429) -- an unpredictable mktemp name until bootstrap-dirs.sh's
+# #362 relocation gives it a private-directory home instead. Collapsing
 # reads must not re-introduce that trade by the back door.
 #
 # The load happens ONCE, at source time, from log.sh's own body — not lazily
@@ -213,7 +215,7 @@ _config_load() {
         # in the hook that decides whether memory gets captured at all. The
         # VALUE is unchanged (the default is still the right answer); being
         # quiet about it was the defect.
-        echo "remember: could not read ${REMEMBER_CONFIG} — is it valid JSON? falling back to per-key reads" >&2
+        echo "remember: could not read ${REMEMBER_CONFIG} -- is it valid JSON? falling back to per-key reads" >&2
         _REMEMBER_CFG_STATE="fallback"
         return 0
     fi
@@ -226,7 +228,7 @@ _config_load() {
             # for it. A warning that fires on a valid config is a warning
             # nobody reads, so this one only shows up when debugging.
             [ "${REMEMBER_DEBUG:-}" = "1" ] && \
-                echo "remember: ${_dump#'#refuse' } — reading config one key at a time" >&2
+                echo "remember: ${_dump#'#refuse' } -- reading config one key at a time" >&2
             _REMEMBER_CFG_STATE="fallback"
             return 0
             ;;
@@ -388,8 +390,9 @@ export REMEMBER_PROMPT_STAMP
 # could not replay — which is exactly why #227 skipped it.
 #
 # What is cached is these two SCALARS, never the merged config file. That file
-# can carry `haiku.oauth_token`, which is why lib-memory-dir.sh creates it 0600
-# per PID under an EXIT trap (#68/#232); publishing it at a stable path to save
+# can carry `haiku.oauth_token`, which is why lib-memory-dir.sh creates it
+# 0600, fresh every invocation, under an EXIT trap (#68/#232/#429);
+# publishing it at a stable path to save
 # processes is a trade this repo has already declined once and is not making by
 # the back door. A save cooldown and a line threshold are neither secret nor
 # expensive to be wrong about for one prompt.
@@ -473,7 +476,7 @@ log_tokens() {
     local output="${3:-0}"
     local cache="${4:-0}"
     local cost="${5:-}"
-    local msg="tokens: ${input}+${cache}cache→${output}out"
+    local msg="tokens: ${input}+${cache}cache->${output}out"
     [ -n "$cost" ] && msg="${msg} (\$${cost})"
     log "$component" "$msg"
 }
@@ -662,7 +665,7 @@ _dispatch_stderr_excerpt() {
         fi
     done < "$_file"
     if [ "$_kept" -eq 0 ]; then
-        printf '%s' "no stderr — it exited without saying anything"
+        printf '%s' "no stderr -- it exited without saying anything"
         return 0
     fi
     [ "$_dropped" -eq 0 ] || _out="$_out [+$_dropped more line(s) not shown]"
@@ -691,7 +694,7 @@ _dispatch_stdout_relay() {
     while IFS= read -r _line || [ -n "$_line" ]; do
         if [ "$_kept" -lt "$_DISPATCH_STDOUT_LINES" ]; then
             if [ "$_framed" -eq 0 ]; then
-                printf '%s%s/%s — the "%s" lines below are output from a locally installed hook, not from the remember plugin ===\n' \
+                printf '%s%s/%s -- the "%s" lines below are output from a locally installed hook, not from the remember plugin ===\n' \
                     "$_DISPATCH_FRAME" "$_event" "$_name" "$_DISPATCH_STDOUT_PREFIX"
                 _framed=1
             fi
@@ -704,7 +707,7 @@ _dispatch_stdout_relay() {
             _dropped=$((_dropped + 1))
         fi
     done < "$_file"
-    [ "$_dropped" -eq 0 ] || printf '%s%s/%s — %s line(s) not shown (hook stdout is capped at %s lines) ===\n' \
+    [ "$_dropped" -eq 0 ] || printf '%s%s/%s -- %s line(s) not shown (hook stdout is capped at %s lines) ===\n' \
         "$_DISPATCH_FRAME" "$_event" "$_name" "$_dropped" "$_DISPATCH_STDOUT_LINES"
 }
 
@@ -744,7 +747,7 @@ _dispatch_report_failure() {
 # reached from another direction: the tool was not quiet, it was reassuring.
 _dispatch_report_skip() {
     local _event="$1" _name="$2" _why="$3"
-    local _msg="WARNING: hook SKIPPED and did not run: $_event/$_name ($_why) — it will not run on any later dispatch until this is fixed"
+    local _msg="WARNING: hook SKIPPED and did not run: $_event/$_name ($_why) -- it will not run on any later dispatch until this is fixed"
     log "dispatch" "$_msg"
     [ -d "$REMEMBER_DIR/logs" ] || return 0
     printf '%s\n' "$(_remember_date +%H:%M:%S) [dispatch] $_msg" \
@@ -793,7 +796,7 @@ report_error() {
 # opposite fixes.
 _dispatch_report_timeout() {
     local _event="$1" _name="$2" _budget="$3" _how="$4" _said="$5"
-    local _msg="WARNING: hook TIMED OUT: $_event/$_name did not return within ${_budget}s and was stopped ($_how). This is NOT a failure report from the hook — it never answered, so whether it did its work is UNKNOWN, and anything it left half-done is its own to unwind. Raise hooks.dispatch_timeout_seconds if this listener is honestly slow, or 0 to disable the bound. It said: $_said"
+    local _msg="WARNING: hook TIMED OUT: $_event/$_name did not return within ${_budget}s and was stopped ($_how). This is NOT a failure report from the hook -- it never answered, so whether it did its work is UNKNOWN, and anything it left half-done is its own to unwind. Raise hooks.dispatch_timeout_seconds if this listener is honestly slow, or 0 to disable the bound. It said: $_said"
     log "dispatch" "$_msg"
     [ -d "$REMEMBER_DIR/logs" ] || return 0
     printf '%s\n' "$(_remember_date +%H:%M:%S) [dispatch] $_msg" \
@@ -1011,7 +1014,7 @@ dispatch() {
             _hpid=$!
             _dispatch_supervise "$_hpid" "$_budget" "$_grace" ""
             _rc=$_DISPATCH_RC
-            printf '%s%s/%s — output NOT SHOWN: stdout could not be captured (no writable %s/tmp), so it was discarded rather than delivered unattributed ===\n' \
+            printf '%s%s/%s -- output NOT SHOWN: stdout could not be captured (no writable %s/tmp), so it was discarded rather than delivered unattributed ===\n' \
                 "$_DISPATCH_FRAME" "$event" "${hook##*/}" "$REMEMBER_DIR"
         fi
 
@@ -1024,7 +1027,7 @@ dispatch() {
             if [ -n "$_err_file" ]; then
                 _said=$(_dispatch_stderr_excerpt "$_err_file")
             else
-                _said="nothing captured — no writable $REMEMBER_DIR/tmp"
+                _said="nothing captured -- no writable $REMEMBER_DIR/tmp"
             fi
             _dispatch_report_timeout "$event" "${hook##*/}" "$_budget" "$_how" "$_said"
             continue
@@ -1039,7 +1042,7 @@ dispatch() {
         if [ -n "$_err_file" ]; then
             _why=$(_dispatch_stderr_excerpt "$_err_file")
         else
-            _why="stderr not captured — no writable $REMEMBER_DIR/tmp, so the reason is MISSING, not absent; rerun the hook by hand to see what it says"
+            _why="stderr not captured -- no writable $REMEMBER_DIR/tmp, so the reason is MISSING, not absent; rerun the hook by hand to see what it says"
         fi
         _dispatch_report_failure "$event" "${hook##*/}" "$_rc" "$_why"
     done
@@ -1218,14 +1221,14 @@ rotate_logs() {
     # diagnostic, and that is exactly the kind of reason this used to lose.
     local err=""
     if [ -z "$archive_name" ]; then
-        err="no unused archive name for ${archive_month} after ${_ROTATE_MAX_PARTS} tries — the names are taken, or ${REMEMBER_LOG_DIR} is not writable. Refusing to overwrite an existing archive"
+        err="no unused archive name for ${archive_month} after ${_ROTATE_MAX_PARTS} tries -- the names are taken, or ${REMEMBER_LOG_DIR} is not writable. Refusing to overwrite an existing archive"
     elif err=$( { cd "$REMEMBER_LOG_DIR" && tar -czf "$archive_name" "${basenames[@]}"; } 2>&1 ); then
         local missing
         missing=$(_rotate_missing_members "$REMEMBER_LOG_DIR" "$archive_name" "${basenames[@]}")
         if [ -z "$missing" ]; then
             while IFS= read -r f; do rm -f "$f"; done <<< "$old_logs"
             rm -f "$state" 2>/dev/null || true
-            log "rotate" "archived ${count} logs → ${archive_name}"
+            log "rotate" "archived ${count} logs -> ${archive_name}"
             return 0
         fi
         # The archive was claimed by this call and held nothing before it, so
@@ -1264,7 +1267,7 @@ rotate_logs() {
         > "$state" 2>/dev/null || true
 
     if [ "$streak" -ge "$_ROTATE_ESCALATE_AFTER" ]; then
-        log "rotate" "ERROR: log rotation has now failed ${streak} times in a row — ${count} aged log files are accumulating unarchived in ${REMEMBER_LOG_DIR} and nothing will clear them until this is fixed. Run /remember:doctor. Last error: ${first_line}"
+        log "rotate" "ERROR: log rotation has now failed ${streak} times in a row -- ${count} aged log files are accumulating unarchived in ${REMEMBER_LOG_DIR} and nothing will clear them until this is fixed. Run /remember:doctor. Last error: ${first_line}"
     else
         log "rotate" "ERROR: tar failed for ${count} logs: ${first_line}"
     fi

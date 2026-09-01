@@ -5,6 +5,7 @@
   "test_command": "pytest",
   "version_sites": [
     ".claude-plugin/plugin.json",
+    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "README.md"
   ],
@@ -21,16 +22,17 @@
     "lanes": []
   },
   "milestones": [],
-  "ci": {
-    "required_checks": 1
-  },
   "release": {
+    "authority": "loop",
     "tag_pattern": "v{version}",
     "merge_method": null,
     "commit_subject": null,
     "triggers": {
       "merged_prs": 10,
       "soak_hours": 48
-    }
+    },
+    "create_release": true,
+    "draft": false,
+    "latest": true
   }
 }

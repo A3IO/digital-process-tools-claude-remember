@@ -1,8 +1,11 @@
-"""Session JSONL parser — extract human/assistant exchanges from Claude Code sessions.
+"""Session JSONL parser — extract human/assistant exchanges from a host's transcript.
 
-Reads Claude Code session JSONL files, filters out metadata and system messages,
-and produces formatted text with role-labeled exchanges suitable for
-summarization by Haiku.
+Reads a session JSONL file, filters out metadata and system messages, and
+produces formatted text with role-labeled exchanges suitable for
+summarization by Haiku. Two transcript envelopes are understood -- Claude
+Code's and Codex's -- via ``sniff_file_envelope()`` and the per-host
+adapters in ``pipeline/host.py`` (#443); a third, unrecognised, shape is
+reported rather than silently read as an empty session.
 
 Supports incremental extraction (only new messages since last save) and
 full extraction (all messages or last N).
@@ -27,6 +30,7 @@ import os
 import re
 import sys
 
+from . import host as _host
 from .slug import session_dir_slug
 from .types import ExtractResult
 
@@ -133,6 +137,86 @@ def _last_save_path(project_dir: str, remember_dir: str | None = None) -> str:
     return effective.rstrip("/\\") + "/tmp/last-save.json"
 
 
+def _unread_envelope_path(project_dir: str, remember_dir: str | None = None) -> str:
+    """Path to the unread-envelope quarantine sidecar (#450).
+
+    Sibling of last-save.json, in the same tmp/ directory, keyed the same
+    way (by session ID) -- but it is a SEPARATE file rather than a field
+    inside last-save.json, because the two have different lifetimes: the
+    saved position always advances (that is what keeps #147's retry loop
+    closed), while an entry here should survive until something has
+    actually read the span it names, however many runs that takes.
+    """
+    effective = remember_dir or os.environ.get("REMEMBER_DIR") or (project_dir.rstrip("/\\") + "/.remember")
+    return effective.rstrip("/\\") + "/tmp/unread-envelope.json"
+
+
+def read_unread_envelope(path: str) -> dict[str, int]:
+    """Read the session -> earliest-unread-line quarantine map.
+
+    Tolerates every shape the file can take, the same way ``read_positions``
+    does: a corrupt or missing file reads as "nothing quarantined" rather
+    than raising, because this is a best-effort recovery aid, not the
+    source of truth for the saved position.
+
+    Args:
+        path: Path to unread-envelope.json.
+
+    Returns:
+        Mapping of session ID to the earliest JSONL line not yet
+        successfully read; empty if unreadable or absent.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (ValueError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: int(v) for k, v in data.items() if _is_line_number(v)}
+
+
+def _write_unread_envelope(path: str, sessions: dict[str, int]) -> None:
+    """Write the quarantine map atomically (temp file + rename)."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sessions, f)
+    os.replace(tmp, path)
+
+
+def mark_unread_envelope(path: str, session_id: str, from_line: int) -> None:
+    """Record that ``session_id`` has an unread span starting at ``from_line``.
+
+    Set-if-absent: an existing entry is never overwritten with a LATER
+    value, because doing so would let the quarantined point creep forward
+    across repeated "still unrecognised" runs and quietly narrow the span a
+    future, envelope-aware build would recover. In practice the caller
+    always passes back the same value it read (extraction resumes FROM the
+    quarantine point once one is set), so this is a safety net rather than
+    the normal path.
+    """
+    sessions = read_unread_envelope(path)
+    if session_id in sessions:
+        return
+    sessions[session_id] = from_line
+    _write_unread_envelope(path, sessions)
+
+
+def clear_unread_envelope(path: str, session_id: str) -> None:
+    """Drop ``session_id``'s quarantine entry, if any.
+
+    Called once something has actually read starting from the quarantined
+    point -- a successful save whose envelope was not "unrecognised" -- so
+    the span is not re-read forever. A no-op if there is nothing to clear,
+    including when the sidecar itself does not exist yet.
+    """
+    sessions = read_unread_envelope(path)
+    if session_id not in sessions:
+        return
+    del sessions[session_id]
+    _write_unread_envelope(path, sessions)
+
+
 def _validate_session_id(session_id: str) -> None:
     """Reject session IDs containing path traversal characters."""
     if "/" in session_id or "\\" in session_id or ".." in session_id:
@@ -153,7 +237,22 @@ def find_session(session_id: str | None = None,
 
     Raises:
         FileNotFoundError: If no session files exist in the directory.
+
+    A supplied ``REMEMBER_TRANSCRIPT_PATH`` (via ``_host.transcript_path()``)
+    is returned here before ``_validate_session_id()``'s own traversal check
+    below ever runs. That is not an oversight (#431): the hooks with no
+    payload of their own to offer (``scripts/post-tool-hook.sh``,
+    ``scripts/user-prompt-hook.sh``) clear the variable before this module is
+    ever imported, and every OTHER caller of this function -- a manual
+    ``scripts/save-session.sh``, ``scripts/doctor.sh``, a direct
+    ``python3 -m pipeline.extract`` -- trusts its own process environment by
+    design, the same way it already trusts ``$PATH`` or ``$HOME``. See
+    ``pipeline/host.transcript_path()``'s docstring for why a containment
+    check was rejected rather than merely deferred.
     """
+    supplied = _host.transcript_path()
+    if supplied:
+        return supplied
     sdir = _session_dir(project_dir)
     if session_id:
         _validate_session_id(session_id)
@@ -209,6 +308,34 @@ def count_lines(path: str) -> int:
     return count
 
 
+def sniff_file_envelope(path: str) -> str:
+    """Which host wrote this transcript, from its own first parseable line.
+
+    Independent of any resume position: incremental extraction can start deep
+    into a file, but the envelope is decided once, from line 0, rather than
+    guessed from whatever line an old ``skip_lines`` happens to land on --
+    every line in one transcript comes from the same host.
+
+    Returns "claude-code", "codex", or "unrecognised" -- the last one also
+    covering an unreadable or entirely-empty file, which offers no line to
+    sniff at all.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                return _host.sniff_envelope(obj)
+    except OSError:
+        return "unrecognised"
+    return "unrecognised"
+
+
 _CHANNEL_RE = re.compile(r"^<channel\b[^>]*>(.*)</channel>$", re.DOTALL)
 
 
@@ -229,7 +356,7 @@ def _channel_text(content) -> str | None:
     return match.group(1).strip()
 
 
-def extract_messages(path: str, skip_lines: int = 0) -> list[tuple[str, str]]:
+def extract_messages(path: str, skip_lines: int = 0, envelope: str = "claude-code") -> list[tuple[str, str]]:
     """Parse a session JSONL file into role-labeled message tuples.
 
     Reads each line as JSON, skips metadata messages and system reminders,
@@ -240,13 +367,27 @@ def extract_messages(path: str, skip_lines: int = 0) -> list[tuple[str, str]]:
         path: Absolute path to the session JSONL file.
         skip_lines: Number of lines to skip from the beginning (for
             incremental extraction after a previous save).
+        envelope: Which host wrote this transcript -- "claude-code" (the
+            default, and the only shape this function understood before
+            #443), "codex", or "unrecognised". Callers determine this once
+            per file via ``sniff_file_envelope()``, independent of
+            ``skip_lines``, and pass it through here; a per-line resniff
+            would misfire on a resume that starts past the file's only
+            self-identifying line.
 
     Returns:
         List of ``("HUMAN", text)`` or ``("AGENT", text)`` tuples,
-        one per message, in chronological order.
+        one per message, in chronological order. Empty for an
+        "unrecognised" envelope -- deliberately: the caller (
+        ``extract_session``) is the one that reports that state loud,
+        via ``ExtractResult.envelope``, rather than this function
+        pretending it read something.
     """
     messages: list[tuple[str, str]] = []
     corrupt_count = 0
+
+    if envelope == "unrecognised":
+        return messages
 
     try:
         f = open(path, encoding="utf-8", errors="replace")
@@ -261,6 +402,12 @@ def extract_messages(path: str, skip_lines: int = 0) -> list[tuple[str, str]]:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 corrupt_count += 1
+                continue
+
+            if envelope == "codex":
+                exchange = _host.codex_exchange(obj)
+                if exchange is not None:
+                    messages.append(exchange)
                 continue
 
             msg_type = obj.get("type")
@@ -364,17 +511,36 @@ def extract_session(
         FileNotFoundError: If no matching session JSONL file is found.
     """
     path = find_session(session_id, project_dir)
-    actual_id = os.path.basename(path).replace(".jsonl", "")
+    # The supplied session_id wins over a basename derived from the transcript
+    # file. A host may name the file anything (Codex's rollout-<date>-<uuid>);
+    # if that leaks into the resume key, get_last_save_line never matches it
+    # and every save re-summarizes from line 0 -- the duplicate #140 exists to
+    # prevent.
+    actual_id = session_id or os.path.basename(path).replace(".jsonl", "")
     total_lines = count_lines(path)
+    envelope = sniff_file_envelope(path)
 
+    used_skip_lines = 0
     if show_all:
-        messages = extract_messages(path, skip_lines=0)
+        messages = extract_messages(path, skip_lines=0, envelope=envelope)
     elif count is not None:
-        messages = extract_messages(path, skip_lines=0)
+        messages = extract_messages(path, skip_lines=0, envelope=envelope)
         messages = messages[-count:]
     else:
         last_line = get_last_save_line(actual_id, project_dir, remember_dir)
-        messages = extract_messages(path, skip_lines=last_line)
+        # #450: a prior run may have advanced the saved position past a span
+        # it never actually read (the envelope was "unrecognised" then), to
+        # keep #147's retry loop closed. That span is quarantined rather than
+        # lost -- start from the quarantine point instead of the saved
+        # position whenever one is on record, so a build that can now parse
+        # the envelope reads the missed span too. Harmless when this run is
+        # STILL unrecognised: extract_messages returns nothing for either
+        # skip point, and the quarantine simply stays in force.
+        unread_from = read_unread_envelope(
+            _unread_envelope_path(project_dir, remember_dir)
+        ).get(actual_id)
+        used_skip_lines = unread_from if unread_from is not None else last_line
+        messages = extract_messages(path, skip_lines=used_skip_lines, envelope=envelope)
 
     # Format as text
     lines = [f"Session: {actual_id}", f"Lines: {total_lines}", "=" * 60]
@@ -394,6 +560,8 @@ def extract_session(
         position=total_lines,
         human_count=human_count,
         assistant_count=assistant_count,
+        envelope=envelope,
+        skip_lines=used_skip_lines,
     )
 
 
@@ -445,6 +613,7 @@ def main() -> None:
             "position": result.position,
             "human_count": result.human_count,
             "assistant_count": result.assistant_count,
+            "envelope": result.envelope,
         }))
     else:
         print(result.exchanges)

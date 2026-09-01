@@ -31,7 +31,13 @@ import os
 import re
 import sys
 
-from .extract import _is_line_number, extract_session, read_positions
+from .extract import (
+    _is_line_number,
+    clear_unread_envelope,
+    extract_session,
+    mark_unread_envelope,
+    read_positions,
+)
 from .haiku import _parse_response
 from .prompts import build_save_prompt, build_ndc_prompt
 
@@ -93,6 +99,17 @@ def cmd_extract(session_id: str, project_dir: str) -> None:
     print(f"ASSISTANT_COUNT={r.assistant_count}")
     print(f"EXCHANGE_COUNT={r.human_count + r.assistant_count}")
     print(f"EXTRACT_FILE={_shell_escape(extract_file)}")
+    # "unrecognised" is a transcript shape neither known host wrote -- distinct
+    # from a genuine 0-exchange session, which save-session.sh must not report
+    # the same way (#443).
+    print(f"ENVELOPE={_shell_escape(r.envelope)}")
+    # The JSONL line this extraction actually started reading from (#450) --
+    # ordinarily the saved position, but the earlier, still-unread point when
+    # a prior "unrecognised" envelope quarantined one. save-session.sh passes
+    # this straight to `save-position`, which is what either keeps the
+    # quarantine pinned to its earliest point or clears it once something has
+    # actually read that span.
+    print(f"SKIP_LINES={r.skip_lines}")
 
 
 def cmd_build_prompt(
@@ -202,6 +219,12 @@ def _emit_haiku_result(r, output_file: str = "") -> None:
     print(f"HAIKU_TEXT_FILE={_shell_escape(text_file)}")
     print(f"IS_SKIP={'true' if r.is_skip else 'false'}")
     print(f"IS_REJECTED={'true' if r.is_rejected else 'false'}")
+    # Which route produced this (#461): a plain "SKIP" in the log is
+    # ambiguous about which provider declined once more than one exists
+    # (#460). Threaded through rather than reconstructed at log time, since
+    # a call-haiku declines (spawn guard) before it even reaches whichever
+    # provider it would have used.
+    print(f"PROVIDER={_shell_escape(r.provider)}")
     print(f"TK_IN={r.tokens.input}")
     print(f"TK_OUT={r.tokens.output}")
     print(f"TK_CACHE={r.tokens.cache}")
@@ -251,7 +274,13 @@ def cmd_call_haiku(prompt_file: str, output_file: str = "", timeout: int = 120) 
 _POSITION_SLOTS = 32
 
 
-def cmd_save_position(last_save_file: str, session_id: str, position: int) -> None:
+def cmd_save_position(
+    last_save_file: str,
+    session_id: str,
+    position: int,
+    envelope: str | None = None,
+    skip_lines: int | None = None,
+) -> None:
     """Record the current extraction position for this session.
 
     Positions are keyed by session ID. A single slot meant two live sessions
@@ -268,14 +297,29 @@ def cmd_save_position(last_save_file: str, session_id: str, position: int) -> No
         last_save_file: Path to the last-save.json file.
         session_id: UUID of the session being saved.
         position: JSONL line number to resume from next time.
+        envelope: This run's ``ExtractResult.envelope`` (#450), or ``None``
+            from a caller that predates it (existing tests, an older
+            wrapper). ``None`` leaves the unread-envelope quarantine
+            untouched -- neither marked nor cleared -- so a caller that has
+            nothing to say about the envelope cannot accidentally erase a
+            quarantine some OTHER, envelope-aware caller set. ``"unrecognised"``
+            marks/keeps ``session_id`` quarantined from ``skip_lines``; any
+            other value clears it, because a save with a recognised envelope
+            means whatever quarantined span there was has now been read.
+        skip_lines: The line this run's extraction actually started from
+            (``ExtractResult.skip_lines``). Used as the quarantine mark point
+            when ``envelope`` is ``"unrecognised"``; falls back to
+            ``position`` if omitted.
     """
     sessions = read_positions(last_save_file)
     # Re-insert at the end: dicts keep insertion order, so the oldest entry is
     # simply the first one, and a session that keeps saving keeps its slot.
     sessions.pop(session_id, None)
     sessions[session_id] = position
+    evicted: list[str] = []
     while len(sessions) > _POSITION_SLOTS:
-        del sessions[next(iter(sessions))]
+        evicted.append(next(iter(sessions)))
+        del sessions[evicted[-1]]
 
     payload = {"sessions": sessions, "session": session_id, "line": position}
     # Strict: machine-written structured JSON. session_id is an ASCII UUID
@@ -289,6 +333,68 @@ def cmd_save_position(last_save_file: str, session_id: str, position: int) -> No
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f)
     os.replace(tmp, last_save_file)
+
+    # A bash-`read`-able mirror of THIS session's own position (#353, part 2
+    # of #350), so scripts/post-tool-hook.sh's per-tool-call hot path can skip
+    # the `pipeline.shell read-position` spawn once a save has landed, instead
+    # of paying an interpreter launch on every single tool call.
+    #
+    # Written AFTER last-save.json above is committed, never before: this is
+    # the ordering that makes the two files agree by construction rather than
+    # by luck. A crash between the two writes leaves this sidecar holding the
+    # PREVIOUS position — stale, and detectable, because the reader on the
+    # other end bounds it against the transcript's own line count — never a
+    # value ahead of the truth. Writing it first would risk the opposite: a
+    # sidecar the hot path trusts reporting a position last-save.json never
+    # actually reached, which is the silently-wrong-delta this feature exists
+    # to avoid.
+    #
+    # One file per session, not one slot shared by all of them — the same
+    # #140 lesson last-save.json itself already learned, for the same reason:
+    # two live sessions saving in the same store would otherwise stamp on
+    # each other's sidecar.
+    sidecar_dir = os.path.dirname(last_save_file)
+    sidecar = os.path.join(sidecar_dir, f"position.{session_id}")
+    sidecar_tmp = f"{sidecar}.tmp"
+    with open(sidecar_tmp, "w", encoding="utf-8") as f:
+        f.write(str(position))
+    os.replace(sidecar_tmp, sidecar)
+
+    # An evicted session's sidecar must not outlive its entry above. Left in
+    # place, a later `read-position` for that same id correctly answers 0 --
+    # this store has forgotten it -- while the hot path's bounds check in
+    # post-tool-hook.sh only compares the sidecar's own value against the
+    # CURRENT transcript's line count, which cannot see that last-save.json
+    # itself has moved on. A stale sidecar that still happens to fall inside
+    # that bound would be trusted, resuming from a position the authoritative
+    # store no longer recognises — the exact duplicate-resummarization bug
+    # #140 fixed for last-save.json, reintroduced through its own mirror.
+    # Best-effort: a session that is gone from the store losing its sidecar a
+    # little late (a failed unlink here) is no worse than #353 not existing.
+    for evicted_id in evicted:
+        try:
+            os.remove(os.path.join(sidecar_dir, f"position.{evicted_id}"))
+        except OSError:
+            pass
+
+    # #450: keep the unread-envelope quarantine in step with the position it
+    # rides beside. `envelope is None` means this caller (an existing test, a
+    # pre-#450 wrapper) has nothing to say about it -- touch nothing, so an
+    # envelope-unaware save cannot silently erase a quarantine some OTHER,
+    # envelope-aware save set for the same session.
+    unread_path = os.path.join(sidecar_dir, "unread-envelope.json")
+    if envelope == "unrecognised":
+        mark_unread_envelope(unread_path, session_id,
+                              skip_lines if skip_lines is not None else position)
+    elif envelope is not None:
+        clear_unread_envelope(unread_path, session_id)
+    # An evicted session's quarantine entry must not outlive it either, for
+    # the same reason as the position sidecar above: last-save.json has
+    # forgotten the session, so a surviving quarantine entry would still be
+    # consulted by a later extraction that can no longer even resume it
+    # against a real saved position.
+    for evicted_id in evicted:
+        clear_unread_envelope(unread_path, evicted_id)
 
 
 def cmd_read_position(last_save_file: str, session_id: str) -> None:
@@ -755,6 +861,8 @@ def main() -> None:
             last_save_file=sys.argv[2],
             session_id=sys.argv[3],
             position=int(sys.argv[4]),
+            envelope=sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] != "" else None,
+            skip_lines=int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[6] != "" else None,
         )
     elif cmd == "consolidate-snapshot":
         cmd_consolidate_snapshot(staging_dir=sys.argv[2], snapshot_dir=sys.argv[3])

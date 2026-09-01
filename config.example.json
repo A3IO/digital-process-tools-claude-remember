@@ -12,7 +12,8 @@
     "delta_lines_trigger": 50,
     "extract_max_bytes": 300000,
     "consolidate_max_bytes": 600000,
-    "memory_inject_max_bytes": 200000
+    "memory_inject_max_bytes": 200000,
+    "staging_warn_bytes": 2000000
   },
   "features": {
     "ndc_compression": true,
@@ -43,6 +44,7 @@
   "prompt_stamp": "full",
   "model": "haiku",
   "reject_pattern": "",
+  "handoff_mode": "single",
   "haiku": {
     "oauth_token": ""
   },
@@ -85,6 +87,20 @@
       "session start. If the past-day staging files are over the cap on their",
       "own, nothing is rotated — no rotation would change the next round."
     ],
+    "staging_warn_bytes": [
+      "Byte threshold (UTF-8) for a one-time WARNING when a today-*.md staging",
+      "file grows past it (#349). Staging files are append-only by design --",
+      "only a SUCCESSFUL consolidation round retires one -- so sustained lock",
+      "contention, a full disk, or a stalled consolidation (features.ndc_",
+      "compression off, or the #346 skip-forever state) leaves the same kind of",
+      "span appended every round with nothing to bound it. This does NOT cap or",
+      "truncate the file; it only logs (report_error, reaching hook-errors.log,",
+      "surfaced by /remember:doctor) the first time the file crosses the line,",
+      "so the growth is visible instead of silent. Set 0 to disable.",
+      "Default 2000000 -- comfortably above a healthy day's worth of staged",
+      "entries and comfortably below consolidate_max_bytes, so a warning here",
+      "is a signal something is stuck well before that separate skip-guard."
+    ],
     "memory_inject_max_bytes": [
       "A memory file larger than this (UTF-8 bytes) is NAMED with its size at",
       "session start instead of being cat'd into context. Default 200000.",
@@ -120,6 +136,39 @@
       "'none' -> gate disabled (only the literal SKIP contract applies).",
       "anything else -> a custom case-insensitive regex; invalid falls back to",
       "the default. An explicit REMEMBER_REJECT_PATTERN env var overrides this."
+    ],
+    "handoff_mode": [
+      "Two or more INTERACTIVE sessions share one project store by design",
+      "(_resolve_memory_project_dir, even across git worktrees, #56) -- but",
+      "the handoff note was always one fixed file, remember.md. The second",
+      "session's /remember silently overwrote the first's, which then",
+      "survived only in that session's own transcript, nowhere on disk (#363).",
+      "This is distinct from #221/#222: those protect a PENDING handoff from",
+      "a session that never writes one back; this is two sessions that each",
+      "DO write one, to the same name.",
+      "",
+      "'single' (default, unchanged) -> every session shares remember.md,",
+      "  exactly as before. The clobber is not fixed for an install that",
+      "  never sets this key -- that trade is deliberate, matching every",
+      "  other behaviour-changing key in this file (data_dir, reject_pattern,",
+      "  git_restore.enabled): a new layout never applies until asked for.",
+      "'per_session' -> the handoff becomes remember.<session_id>.md, keyed",
+      "  by the SessionStart payload's own session_id. History, recent.md,",
+      "  archive.md and consolidation are untouched -- only the single",
+      "  handoff slot is namespaced.",
+      "",
+      "per_session needs a usable session_id to namespace anything. If none",
+      "reached the hook (the payload carried none, or it failed the #270",
+      "identifier sanitizer), the session falls back to the shared",
+      "remember.md -- the '=== HANDOFF ===' hint still points at it, since",
+      "that path is still correct (withholding the hint here broke external",
+      "storage mode, where it is the only real path), but a visible line",
+      "says the fallback happened so it does not read as isolation that",
+      "never applied. No pruning of stale remember.<session_id>.md files",
+      "ships with this key: the handoff is the user's own writing with no",
+      "copy anywhere else, and a delete keyed on \"the transcript looks gone\"",
+      "can misfire for reasons other than the transcript actually being",
+      "gone. Stale per-session handoffs accumulate until removed by hand."
     ],
     "git_backup.allow_remote_change": [
       "Guard against a swapped push remote. The backup hook records the remote",

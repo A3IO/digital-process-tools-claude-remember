@@ -62,15 +62,49 @@
 [ -n "${_REMEMBER_LIB_ENV_CACHE_LOADED:-}" ] && return 0
 _REMEMBER_LIB_ENV_CACHE_LOADED=1
 
-# Sets _REMEMBER_ENV_CACHE_FILE. Returns 1 when there is no project to key on.
+# Sets _REMEMBER_ENV_CACHE_FILE and _REMEMBER_ENV_CACHE_KEY. Returns 1 when
+# there is no project to key on.
 #
-# Keyed on the RAW CLAUDE_PROJECT_DIR, before resolve-paths.sh normalises it:
-# the reader has not run that normalisation yet (it forks `tr` on Git Bash), and
-# both sides comparing the same environment variable is what makes the key
-# agree without either side computing anything.
+# Keyed on the RAW CLAUDE_PROJECT_DIR when it is set, falling back to
+# REMEMBER_HOOK_CWD (#469): Codex and Gemini CLI set neither CLAUDE_PROJECT_DIR
+# nor any variable this cache could key on before resolve-paths.sh runs, and
+# that absence is the entire premise of #407/#411/#444 -- the same hosts
+# #411/#444 gave every hook a REMEMBER_HOOK_CWD fallback for. Without this,
+# resolve-paths.sh:270 still exports the RESOLVED CLAUDE_PROJECT_DIR before
+# _remember_env_cache_publish runs, so a cache file is written every time and
+# never found by _remember_env_cache_load, which runs in a fresh process
+# before that export exists. Neither value is normalised here (this can run
+# before resolve-paths.sh's Windows drive-letter normalisation, which forks
+# `tr` on Git Bash) -- the per-process pin inside the function below is what
+# keeps the key stable across a call that runs before normalisation and one
+# that runs after: without it, a call after resolve-paths.sh has normalised
+# and exported CLAUDE_PROJECT_DIR would compute a DIFFERENT key than an
+# earlier call in the same process saw, on a platform where normalisation
+# changes the string (a no-op on macOS/Linux, where raw and resolved always
+# agree -- #79 already excludes Windows from the bash-subprocess test suite
+# that exercises most of this file, which is why this needed its own
+# reasoning rather than a test run here).
 _remember_env_cache_path() {
-    local _key="${CLAUDE_PROJECT_DIR:-}"
+    # Pinned once per process (#469): this function runs both BEFORE
+    # resolve-paths.sh (from _remember_env_cache_load, when CLAUDE_PROJECT_DIR
+    # is still unset on Codex/Gemini and REMEMBER_HOOK_CWD is the only
+    # signal) and AFTER it (from _remember_env_cache_publish, by which point
+    # resolve-paths.sh has exported the RESOLVED -- and on Windows/Git-Bash,
+    # NORMALIZED -- CLAUDE_PROJECT_DIR). Recomputing on the second call would
+    # let the now-set CLAUDE_PROJECT_DIR win over the raw REMEMBER_HOOK_CWD
+    # this same invocation's earlier (failed) load call already keyed on --
+    # on a platform where normalization actually changes the string (drive-
+    # letter rewriting; a no-op on macOS/Linux, where raw and resolved always
+    # agree), write and read would target different files, permanently,
+    # exactly the #469 symptom relocated to Windows. resolve-paths.sh only
+    # resolves once per hook invocation, so once a key is known in THIS
+    # process it is reused rather than asked of the environment again.
+    if [ -n "${_REMEMBER_ENV_CACHE_KEY:-}" ]; then
+        return 0
+    fi
+    local _key="${CLAUDE_PROJECT_DIR:-${REMEMBER_HOOK_CWD:-}}"
     [ -n "$_key" ] || return 1
+    _REMEMBER_ENV_CACHE_KEY="$_key"
     _key="${_key//[!a-zA-Z0-9]/-}"
     # Filename length limits are real (255 bytes on most filesystems) and a deep
     # project path exceeds them. Keep the TAIL: the end of a path is what
@@ -141,7 +175,13 @@ _remember_env_cache_load() {
     # once, at upgrade.
     case "$_cooldown" in '' | *[!0-9]*) return 1 ;; esac
     case "$_delta" in '' | *[!0-9]*) return 1 ;; esac
-    [ "$_env_proj" = "${CLAUDE_PROJECT_DIR:-}" ] || return 1
+    # Compared against the SAME identity _remember_env_cache_path just keyed
+    # on (CLAUDE_PROJECT_DIR, falling back to REMEMBER_HOOK_CWD, #469) rather
+    # than raw CLAUDE_PROJECT_DIR directly -- on Codex/Gemini CLAUDE_PROJECT_DIR
+    # is unset in the fresh process reading this cache, so comparing against
+    # it directly would reject every cache this fallback lets the path
+    # function find, defeating the fix at this one remaining line.
+    [ "$_env_proj" = "${_REMEMBER_ENV_CACHE_KEY:-}" ] || return 1
     [ "$_env_pipe" = "${CLAUDE_PLUGIN_ROOT:-}" ] || return 1
     [ "$_env_home" = "${HOME:-}" ] || return 1
     [ -d "$_pipe" ] || return 1
@@ -171,19 +211,53 @@ _remember_env_cache_load() {
 # could not write a cache file has still done its actual job.
 _remember_env_cache_publish() {
     [ "${REMEMBER_ENV_CACHE:-1}" = "1" ] || return 0
-    [ -n "${CLAUDE_PROJECT_DIR:-}" ] || return 0
+    # Same fallback as the key itself (#469): by the time any real caller
+    # reaches here, resolve-paths.sh has already exported the resolved
+    # CLAUDE_PROJECT_DIR (resolve-paths.sh:270), so this is normally
+    # redundant with that export -- but requiring it directly, rather than
+    # accepting REMEMBER_HOOK_CWD alone, would silently refuse to publish a
+    # cache whose only identity source is REMEMBER_HOOK_CWD, defeating the
+    # fix on any future caller that publishes before that export runs.
+    [ -n "${CLAUDE_PROJECT_DIR:-}${REMEMBER_HOOK_CWD:-}" ] || return 0
     [ -n "${REMEMBER_DIR:-}" ] || return 0
     [ -n "${PROJECT_DIR:-}" ] || return 0
     [ -n "${PIPELINE_DIR:-}" ] || return 0
+    # log.sh returns early — before it ever sets these two — on a store whose
+    # logs/ dir it cannot create (#358). Two of this function's three callers
+    # (user-prompt-hook.sh, post-tool-hook.sh's slow path) source log.sh with
+    # stderr suppressed and call this unconditionally, so an early return left
+    # both variables unset here, not merely absent from config. Defaulting them
+    # below in that case would publish 120/50 as though config had said so, and
+    # the load side cannot tell that apart from a real answer — both are
+    # digits. Required here, not defaulted, same rule _remember_env_cache_load
+    # already applies to the same two keys and for the same reason (#301):
+    # skip the whole publish rather than write a cache the load side would
+    # accept but is really a stand-in for a chain that never ran. A cache one
+    # write cycle stale is the ordinary case anywhere in this file; a cache
+    # that lies about config is the thing #358 exists to refuse.
+    [ -n "${REMEMBER_SAVE_COOLDOWN:-}" ] || return 0
+    [ -n "${REMEMBER_DELTA_THRESHOLD:-}" ] || return 0
     _remember_env_cache_path || return 0
 
-    local _f="$_REMEMBER_ENV_CACHE_FILE" _t="${_REMEMBER_ENV_CACHE_FILE}.$$"
-    # 0600 before a single byte of it exists. Every entry point sets umask 077
-    # (#68), but this decides where memory gets written and its mode must not
-    # depend on the caller having done that.
-    (umask 077; : > "$_t") 2>/dev/null || return 0
+    local _f="$_REMEMBER_ENV_CACHE_FILE" _t
+    # mktemp, not a PID-suffixed literal path (#429): $_f itself is built from
+    # CLAUDE_PROJECT_DIR (predictable to anyone who knows the project path),
+    # and appending "$$" to it is no better -- both name a path in a SHARED
+    # tmp dir before this process has created anything there. The shell's `>`
+    # follows a symlink when opening its target and truncates on open, before
+    # a byte is written, so a symlink pre-seeded at that name would receive
+    # whatever this function goes on to write. mktemp creates the file
+    # atomically at an unpredictable name and already 0600 on every mktemp
+    # this repo relies on (GNU and BSD/macOS alike) -- no umask needed, and no
+    # trailing suffix after the X's (BSD mktemp only substitutes a run of X's
+    # at the very end of the template; anything after is left literal).
+    _t=$(mktemp "${_f}.XXXXXX" 2>/dev/null) || return 0
     {
-        printf 'CACHE_ENV_PROJECT_DIR=%s\n' "$CLAUDE_PROJECT_DIR"
+        # The same identity the file is keyed and validated on (#469), not
+        # raw CLAUDE_PROJECT_DIR: on a caller whose only identity source was
+        # REMEMBER_HOOK_CWD, printing CLAUDE_PROJECT_DIR here would record a
+        # value _remember_env_cache_load's later comparison can never match.
+        printf 'CACHE_ENV_PROJECT_DIR=%s\n' "$_REMEMBER_ENV_CACHE_KEY"
         printf 'CACHE_ENV_PLUGIN_ROOT=%s\n' "${CLAUDE_PLUGIN_ROOT:-}"
         printf 'CACHE_ENV_HOME=%s\n' "${HOME:-}"
         printf 'PROJECT_DIR=%s\n' "$PROJECT_DIR"
@@ -191,8 +265,12 @@ _remember_env_cache_publish() {
         printf 'REMEMBER_DIR=%s\n' "$REMEMBER_DIR"
         printf 'REMEMBER_TZ=%s\n' "${REMEMBER_TZ:-}"
         printf 'REMEMBER_PROMPT_STAMP=%s\n' "${REMEMBER_PROMPT_STAMP:-full}"
-        printf 'REMEMBER_SAVE_COOLDOWN=%s\n' "${REMEMBER_SAVE_COOLDOWN:-120}"
-        printf 'REMEMBER_DELTA_THRESHOLD=%s\n' "${REMEMBER_DELTA_THRESHOLD:-50}"
+        # No `:-120`/`:-50` fallback here — the guard above already refused to
+        # reach this line unless both were actually set by log.sh, and a
+        # default at the point of writing is exactly the silent stand-in
+        # #358 was filed about.
+        printf 'REMEMBER_SAVE_COOLDOWN=%s\n' "$REMEMBER_SAVE_COOLDOWN"
+        printf 'REMEMBER_DELTA_THRESHOLD=%s\n' "$REMEMBER_DELTA_THRESHOLD"
         printf 'MEMORY_PROJECT_DIR=%s\n' "${MEMORY_PROJECT_DIR:-$PROJECT_DIR}"
         printf 'CACHE_CONFIG=%s\n' "${PIPELINE_DIR}/config.json"
         printf 'CACHE_CONFIG=%s\n' "${HOME:-}/.remember/config.json"

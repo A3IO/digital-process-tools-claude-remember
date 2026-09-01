@@ -40,7 +40,7 @@ class TokenUsage:
 
     def __str__(self) -> str:
         """Format as a compact summary string for log output."""
-        return f"{self.input}+{self.cache}cache→{self.output}out (${self.cost_usd:.4f})"
+        return f"{self.input}+{self.cache}cache->{self.output}out (${self.cost_usd:.4f})"
 
 
 @dataclass
@@ -61,12 +61,22 @@ class HaikuResult:
             caller has to be able to say so — reported as a plain SKIP it is
             indistinguishable from a genuinely empty session, and it slips
             past max_summary_failures too, which only counts hard errors.
+        provider: Which summarizer actually produced this result -- "claude"
+            or "codex" (#460/#461). Multiple providers exist now, so a SKIP
+            in the log is ambiguous about which one declined unless this is
+            threaded through: the "was this host-shaped?" question #461 asks
+            is only answerable if the log can name which route a given
+            verdict came from. Set explicitly by whichever call path built
+            this result; the default is "claude" because that was the only
+            provider before #460 and every construction site that predates
+            it (tests included) is correct leaving it unset.
     """
 
     text: str = ""
     tokens: TokenUsage = field(default_factory=TokenUsage)
     is_skip: bool = False
     is_rejected: bool = False
+    provider: str = "claude"
 
 
 @dataclass
@@ -84,6 +94,21 @@ class ExtractResult:
         human_count: Number of human (user) messages extracted.
         assistant_count: Number of assistant messages extracted.
         corrupt_lines: Number of lines that failed JSON parsing.
+        envelope: Which host wrote this transcript's lines, as identified by
+            ``pipeline.host.sniff_envelope()`` from the file's own first line
+            -- "claude-code", "codex", or "unrecognised". "unrecognised" is
+            the loud third state: a shape this module does not know, reported
+            rather than silently parsed as a session with nothing in it (#443).
+        skip_lines: The JSONL line this extraction actually started reading
+            from. Normally the caller's last saved position, but when a prior
+            run recorded this session in the unread-envelope quarantine
+            (#450 -- an "unrecognised" envelope that advanced the saved
+            position anyway, to keep #147's loop closed, without ever having
+            read the span), this is that earlier, still-unread point instead
+            -- so a later build that CAN parse the envelope re-reads the span
+            the earlier build only skipped past. Callers report it (and
+            ``save-position`` consumes it) so the quarantine can be cleared
+            once something has actually read that span.
     """
 
     exchanges: str = ""
@@ -91,6 +116,8 @@ class ExtractResult:
     human_count: int = 0
     assistant_count: int = 0
     corrupt_lines: int = 0
+    envelope: str = ""
+    skip_lines: int = 0
 
 
 @dataclass

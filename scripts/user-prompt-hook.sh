@@ -54,6 +54,68 @@ _HOOK_DIR="${BASH_SOURCE[0]%/*}"
 # under the summarizer's temp dir and injects into its context.
 [ -n "${REMEMBER_NESTED_SUMMARIZER:-}" ] && exit 0
 
+# --- REMEMBER_HOOK_CWD (#417, #444) ---
+# resolve-paths.sh falls back to this variable when CLAUDE_PROJECT_DIR is
+# unset (#411). Cleared here first and unconditionally, before anything below
+# could set or inherit it -- the #417 leak this closes is a DIFFERENT
+# session's SessionStart-exported value surviving into a hook that has not
+# validated it, or (on a host that reuses one process environment across
+# invocations) a stale value this same hook wrote on a PREVIOUS run. This
+# hook now offers its own stdin `cwd` further down (#444, only on the slow
+# path below), but that read has to happen after this unset, never instead of
+# it, or the #417 leak reopens. Clearing it here is cheap and unconditionally
+# correct regardless of whether that reuse is possible on any supported host:
+# on the common path CLAUDE_PROJECT_DIR is already set and this arm never
+# runs anyway.
+unset REMEMBER_HOOK_CWD
+
+# --- REMEMBER_TRANSCRIPT_PATH (#424) ---
+# pipeline/host.transcript_path() trusts this variable once it names a real
+# file, and pipeline/extract.py's find_session() returns that value BEFORE
+# the traversal validator (_validate_session_id) ever runs -- so a value set
+# anywhere in the ambient environment reads an arbitrary file straight into
+# the memory store, no `../` required. Only session-start-hook.sh and
+# session-end-hook.sh have a legitimate transcript_path to offer, extracted
+# fresh from their own stdin payload on every run. This hook has none and
+# must not silently consult whatever the process environment already holds,
+# for the same reason and under the same unestablished-reachability
+# reasoning as the REMEMBER_HOOK_CWD unset just above (#417).
+unset REMEMBER_TRANSCRIPT_PATH
+
+# --- Host-conditional stdout shape (#451) ---
+# Claude Code treats this hook's plain stdout as `additionalContext` -- that
+# is what the prompt stamp below is for, and every existing regression test
+# (#301, #280) pins it byte-for-byte. Codex's own UserPromptSubmit parser
+# does something different: it sniffs the first non-whitespace byte of
+# stdout, and `{` or `[` means "this claims to be my JSON contract"
+# (codex-rs/hooks/src/engine/output_parser.rs::looks_like_json, read from
+# openai/codex @ 2026-08-29 -- Codex ships no separate hooks.md). That
+# contract is user-prompt-submit.command.output.schema.json
+# (codex-rs/hooks/schema/generated/), consumed by
+# events/user_prompt_submit.rs::parse_completed. The plain stamp this hook
+# has always printed, "[HH:MM TZ -- user]", opens with `[` -- so Codex tries
+# to read it as that JSON contract, fails, and reports the hook run
+# HookRunStatus::Failed even though nothing failed. Plain text that does
+# NOT open with `{`/`[` is accepted by that same parser and appended as
+# additionalContext with status Completed, so the fix is not "never print
+# the stamp on this host", it is "print it inside the envelope Codex's own
+# schema names" -- see the tail of this file.
+#
+# CLAUDE_PROJECT_DIR is the signal already used for this exact distinction
+# in resolve-paths.sh's own ENVIRONMENT block: Claude Code always sets it,
+# Codex documents no such variable and never does, and Gemini CLI
+# "documents no hook environment variables whatsoever" either. So this flag
+# also covers Gemini CLI, whose stdout contract this repo has NOT observed
+# -- REASONED, not observed, for any host besides Codex 0.150.1. The JSON
+# envelope is what Codex's own schema documents, and is no worse than a
+# bracket that collides with Codex's heuristic on every host it has not
+# been checked against either.
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    _REMEMBER_HOST_JSON_STDOUT=0
+else
+    _REMEMBER_HOST_JSON_STDOUT=1
+fi
+
 source "$_HOOK_DIR/lib-clock.sh"
 source "$_HOOK_DIR/lib-env-cache.sh"
 
@@ -78,6 +140,60 @@ if _remember_env_cache_load && [ ! -d "$PIPELINE_DIR/hooks.d/after_user_prompt" 
 fi
 
 if [ "$_REMEMBER_FAST" = "0" ]; then
+    # --- REMEMBER_HOOK_CWD from stdin (#444) ---
+    # resolve-paths.sh's REMEMBER_HOOK_CWD fallback (#411) only ever gets a
+    # value from session-start-hook.sh and session-end-hook.sh, which is why
+    # a host that never sets CLAUDE_PROJECT_DIR (Codex, Gemini CLI) hits the
+    # FATAL below on this hook: the #417 unset above left it correct but with
+    # no legitimate source of its own. UserPromptSubmit carries `cwd` on its
+    # own stdin payload on all three hosts (#407's comparison table), so read
+    # it here -- ONLY on this slow path. The fast path above replays an
+    # already-resolved REMEMBER_DIR and never sources resolve-paths.sh at
+    # all, so it has nothing to feed this to; reading stdin there would be a
+    # brand new cost on the path #227 exists to keep cheap. This path already
+    # forks bootstrap-dirs.sh and log.sh below, once per project per config
+    # change (see the COST section above) -- one bounded stdin read here does
+    # not change that shape.
+    #
+    # Bounded in TIME only (`read -t 1`, never a tty), the same reasoning
+    # every other stdin-reading hook in this repo already carries: a blocking
+    # read here is not a slow prompt, it is a lost one (see the COST section
+    # above). bash 3.2 has no sub-second -t, hence 1.
+    _HOOK_STDIN=""
+    if [ ! -t 0 ]; then
+        _line=""
+        while IFS= read -r -t 1 _line || [ -n "$_line" ]; do
+            _HOOK_STDIN="$_HOOK_STDIN$_line"
+            _line=""
+        done
+    fi
+    # The same deliberately narrow extractor session-start-hook.sh uses: the
+    # key must be followed by nothing but whitespace and a colon before the
+    # value's opening quote, so a `cwd` appearing inside some other field
+    # (unlikely on this payload, but not this function's job to assume) is
+    # not mistaken for it.
+    _stdin_cwd() {
+        local raw="$1" rest prefix value
+        case "$raw" in *'"cwd"'*) ;; *) return 1 ;; esac
+        rest=${raw#*\"cwd\"}
+        prefix=${rest%%\"*}
+        case "$prefix" in *[!:[:space:]]*) return 1 ;; esac
+        value=${rest#*\"}
+        value=${value%%\"*}
+        [ -n "$value" ] || return 1
+        printf '%s' "$value"
+    }
+    # Validated the same way session-start-hook.sh validates its own copy:
+    # data from a host payload, at the point of entry. A project directory
+    # legitimately contains slashes and dots, so only an embedded newline or
+    # carriage return is rejected -- whether the value actually names a
+    # directory is decided in resolve-paths.sh, which falls back to the
+    # existing derivation when it does not.
+    REMEMBER_HOOK_CWD=$(_stdin_cwd "$_HOOK_STDIN" 2>/dev/null) || REMEMBER_HOOK_CWD=""
+    case "$REMEMBER_HOOK_CWD" in
+        *$'\n'*|*$'\r'*) REMEMBER_HOOK_CWD="" ;;
+    esac
+    export REMEMBER_HOOK_CWD
     # Opt into resolve-paths.sh's soft-failure mode — see the comment in
     # session-start-hook.sh. This hook must never block the agent, so a
     # resolution failure is a silent no-op, not a crash.
@@ -86,6 +202,14 @@ if [ "$_REMEMBER_FAST" = "0" ]; then
     source "$_HOOK_DIR/log.sh" 2>/dev/null
     _remember_env_cache_publish
 fi
+
+# log.sh returns early — before it defines dispatch() — on a store whose
+# logs/ dir it cannot create. That leaves dispatch() undefined on this branch
+# only (the fast path above already stubs it unconditionally), and this hook
+# is documented "EXIT CODES: 0 Always": it must not shell out to a
+# "command not found" for a listener nobody has to install (adjacent to
+# #361, same mechanism, this file's own unguarded call).
+declare -F dispatch >/dev/null 2>&1 || dispatch() { :; }
 
 # --- Notices for the human (#200, #253) ───────────────────────────────────
 # Other hooks leave a file here when they find something the HUMAN has to know
@@ -178,10 +302,10 @@ if [ "$_REMEMBER_STAMP" = "stable" ]; then
   echo "[$_REMEMBER_WHO]"
 elif [ -n "$CTX_PCT" ]; then
   _REMEMBER_NOW=$(_remember_date '+%H:%M %Z')
-  echo "[$_REMEMBER_NOW — $_REMEMBER_WHO — ${CTX_PCT}%]"
+  echo "[$_REMEMBER_NOW -- $_REMEMBER_WHO -- ${CTX_PCT}%]"
 else
   _REMEMBER_NOW=$(_remember_date '+%H:%M %Z')
-  echo "[$_REMEMBER_NOW — $_REMEMBER_WHO]"
+  echo "[$_REMEMBER_NOW -- $_REMEMBER_WHO]"
 fi
 # Kept under `stable`, deliberately: it is gated on a threshold, so it changes
 # bytes only when it changes behaviour — and it is the only line here anybody
@@ -199,7 +323,41 @@ dispatch "after_user_prompt"
 # detect-tools.sh is deliberately NOT sourced here — it hard-exits when python
 # is missing, and this hook must never block a prompt. jq is resolved directly.
 JQ_BIN="${JQ:-jq}"
-if [ -z "$NOTICE_MSG" ]; then
+if [ "$_REMEMBER_HOST_JSON_STDOUT" = "1" ]; then
+    # --- Non-Claude-Code host (#451) ---
+    # See the comment at the top of this file. Whether or not there is a
+    # notice, this host's stdout must never open with the bare stamp -- so
+    # both are folded into the one JSON envelope Codex's own schema names,
+    # never printed raw the way the Claude Code branch below does.
+    if [ -z "$CTX" ] && [ -z "$NOTICE_MSG" ]; then
+        : # nothing to say -- printing nothing is Completed on every host
+    else
+        _JSON=""
+        if command -v "$JQ_BIN" >/dev/null 2>&1; then
+            _JSON=$("$JQ_BIN" -n --arg ctx "$CTX" --arg msg "$NOTICE_MSG" \
+                '(if $ctx != "" then {hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$ctx}} else {} end)
+                 + (if $msg != "" then {systemMessage:$msg} else {} end)' 2>/dev/null) || _JSON=""
+        fi
+        if [ -n "$_JSON" ]; then
+            printf '%s\n' "$_JSON"
+        else
+            # jq missing, or present but failed: stay silent on stdout
+            # rather than print the bracketed stamp raw -- that raw print
+            # is the exact defect this branch exists to avoid, and a bare
+            # `[`/`{` on this host reads as Failed regardless of WHY it is
+            # there. Silent on stdout is not silent everywhere, though:
+            # `jq` is already a hard dependency of this hook's slow path
+            # (bootstrap-dirs.sh, log.sh's own config reads), so its
+            # absence here is a symptom worth a diagnostic line -- logged
+            # only when `log()` is actually defined (the fast path never
+            # sources log.sh, so it never gets one; that path also never
+            # dispatches `after_user_prompt` for the same #227 cost reason,
+            # and losing this one diagnostic line there is the same trade).
+            declare -F log >/dev/null 2>&1 && log "hook" \
+                "user-prompt-hook: jq unavailable/failed on a non-Claude-Code host -- dropped this turn's Codex-safe stdout envelope (stamp/notice lost, not printed raw to avoid the #451 collision)"
+        fi
+    fi
+elif [ -z "$NOTICE_MSG" ]; then
     printf '%s\n' "$CTX"
 else
     # jq's status must not become this hook's status. Left as the last command

@@ -52,6 +52,93 @@
 #
 # ============================================================================
 
+# --- Where this script lives ---
+# Parameter expansion, not three `dirname` forks (#230) — the same pattern
+# log.sh and user-prompt-hook.sh already use. A path with no slash in it
+# leaves the filename behind, not a directory; `dirname` answered "." and
+# this must too.
+_HOOK_DIR="${BASH_SOURCE[0]%/*}"
+[ "$_HOOK_DIR" = "${BASH_SOURCE[0]}" ] && _HOOK_DIR="."
+
+# --- Nested summarizer: there is no project here (#204) ---
+# The same fast-path guard post-tool-hook.sh, user-prompt-hook.sh and
+# session-end-hook.sh already carry ahead of their own stdin capture, added
+# here for the same reason (#411): stdin is now read BEFORE resolve-paths.sh
+# is sourced (below), so REMEMBER_HOOK_CWD is available to it. Without a
+# guard here, every nested `claude -p` summarizer child would pay for the
+# bounded stdin read before ever reaching the guard resolve-paths.sh still
+# carries for every OTHER caller. Exiting here is strictly cheaper than
+# before the #411 reorder, not more expensive: previously the guard fired
+# inside resolve-paths.sh, after umask and plugin-root resolution had
+# already run; now it fires before any of that, and before the stdin read.
+[ -n "${REMEMBER_NESTED_SUMMARIZER:-}" ] && exit 0
+
+# ── Read stdin once, before resolving paths (#411) ────────────────────────
+# `session_id` / `transcript_path` / `source` used to be extracted here, just
+# after resolve-paths.sh ran. `cwd` (below) is new, and resolve-paths.sh needs
+# it BEFORE it resolves PROJECT_DIR — a stdin `cwd` is the fallback once
+# CLAUDE_PROJECT_DIR is unset, which is exactly the host that does not set it
+# — so the capture moves up ahead of the source line. stdin is single-read
+# and three other hooks already share this shape; nothing here may consume it
+# twice.
+#
+# The read is bounded in TIME and only in time — `read -t 1`, and never from
+# a tty — for the reason post-tool-hook.sh records: a hook that blocks on
+# stdin is not a slow session start, it is one that never starts. bash 3.2
+# has no sub-second -t, hence 1.
+HOOK_STDIN=""
+if [ ! -t 0 ]; then
+    _line=""
+    while IFS= read -r -t 1 _line || [ -n "$_line" ]; do
+        HOOK_STDIN="$HOOK_STDIN$_line"
+        _line=""
+    done
+fi
+
+# The same deliberately narrow extractor post-tool-hook.sh and
+# session-end-hook.sh use, and for the same reason: the key must be followed
+# by nothing but whitespace and a colon before the value's opening quote, so
+# a `cwd` (or `session_id`, or `transcript_path`) appearing inside some other
+# field is not mistaken for it. It is a heuristic and is treated as one —
+# every result is validated below before anything is done with it.
+_stdin_json_string() {
+    local key="$1" raw="$2" rest prefix value
+    case "$raw" in *"\"$key\""*) ;; *) return 1 ;; esac
+    rest=${raw#*\"$key\"}
+    prefix=${rest%%\"*}
+    case "$prefix" in *[!:[:space:]]*) return 1 ;; esac
+    value=${rest#*\"}
+    value=${value%%\"*}
+    [ -n "$value" ] || return 1
+    printf '%s' "$value"
+}
+
+# ── The cwd the host handed us (#411) ──────────────────────────────────────
+# Every host puts `cwd` on the SessionStart payload (#407's comparison table),
+# but only Claude Code also publishes it as CLAUDE_PROJECT_DIR. Exported for
+# resolve-paths.sh to consult as its fallback once CLAUDE_PROJECT_DIR is
+# unset — precedence is CLAUDE_PROJECT_DIR, then this, then the existing
+# .claude/remember layout derivation, then the existing failure; a stdin
+# `cwd` that disagrees with a SET CLAUDE_PROJECT_DIR must not win, which is
+# why resolve-paths.sh checks CLAUDE_PROJECT_DIR first and this is read
+# regardless of whether it turns out to be used.
+#
+# Validated the same way REMEMBER_TRANSCRIPT_PATH is, below: data from a host
+# payload, at the point of entry, not the point of use. A project directory
+# legitimately contains slashes and dots, so it cannot share
+# CURRENT_SESSION_ID's character allowlist — only a carriage return or a raw
+# newline is rejected (the read loop above already strips every line
+# terminator before HOOK_STDIN is assembled, so the newline arm is a belt no
+# buckle can ever need — kept in case a future change to that loop ever
+# preserves one). Whether the value actually names a directory is decided in
+# resolve-paths.sh, which falls back to the existing derivation when it does
+# not.
+REMEMBER_HOOK_CWD=$(_stdin_json_string cwd "$HOOK_STDIN" 2>/dev/null) || REMEMBER_HOOK_CWD=""
+case "$REMEMBER_HOOK_CWD" in
+    *$'\n'*|*$'\r'*) REMEMBER_HOOK_CWD="" ;;
+esac
+export REMEMBER_HOOK_CWD
+
 # resolve-paths.sh exits its caller on failure by default (a caller that keeps
 # going with unresolved paths writes memory to the wrong place). This hook is
 # documented to never block session startup, so it opts into soft failure and
@@ -60,18 +147,9 @@
 # This used to claim the nested `claude -p` summarizer would fail here because
 # it "has no CLAUDE_PROJECT_DIR". It has one: Claude Code sets it afresh in the
 # child from that session's cwd, so resolution SUCCEEDED and the hook ran with
-# the temp dir as its project (#204). resolve-paths.sh now stops on the
-# REMEMBER_NESTED_SUMMARIZER marker instead, and returns 1 into the `|| exit 0`
-# below.
-#
-# Parameter expansion, not three `dirname` forks (#230) — the same pattern
-# log.sh and user-prompt-hook.sh already use. SessionStart runs once per session
-# rather than per tool call, so this is not the hot path post-tool-hook.sh is;
-# it is a startup cost the user waits on, paid for nothing. A path with no slash
-# in it leaves the filename behind, not a directory; `dirname` answered "." and
-# this must too.
-_HOOK_DIR="${BASH_SOURCE[0]%/*}"
-[ "$_HOOK_DIR" = "${BASH_SOURCE[0]}" ] && _HOOK_DIR="."
+# the temp dir as its project (#204). The guard above (REMEMBER_NESTED_SUMMARIZER)
+# is why this hook never reaches this line for that child; resolve-paths.sh
+# keeps its own copy of the same guard for every OTHER caller that sources it.
 REMEMBER_PATHS_SOFT_FAIL=1 source "$_HOOK_DIR/resolve-paths.sh" || exit 0
 source "$_HOOK_DIR/detect-tools.sh"
 source "$_HOOK_DIR/bootstrap-dirs.sh"
@@ -84,7 +162,7 @@ source "$PLUGIN_ROOT/scripts/log.sh" 2>/dev/null
 # diagnostic up front. Exit 127 (command-missing) to match the degraded-env
 # contract that tolerates rc in (0, 127), not a bare 1.
 if ! command -v _remember_date >/dev/null 2>&1; then
-    echo "session-start-hook: ERROR — failed to source $PLUGIN_ROOT/scripts/log.sh" >&2
+    echo "session-start-hook: ERROR -- failed to source $PLUGIN_ROOT/scripts/log.sh" >&2
     exit 127
 fi
 TODAY=$(_remember_date '+%Y-%m-%d')
@@ -115,44 +193,8 @@ _remember_env_cache_publish
 # is read too, since #339, but for a different job entirely — how much of the
 # memory recap to print — and nothing on this path consults it.
 #
-# Reading stdin is only safe if it cannot wait forever, so this takes both
-# guards post-tool-hook.sh documents: a tty stdin (hand invocation from a
-# shell) is never read at all, and the read is bounded by `read -t 1`. bash 3.2
-# has no sub-second -t, hence 1. This runs once per session rather than once
-# per tool call, so the worst case is a second of startup — but it is still
-# bounded, because the unbounded version is a session that never begins.
-HOOK_STDIN=""
-if [ ! -t 0 ]; then
-    _line=""
-    while IFS= read -r -t 1 _line || [ -n "$_line" ]; do
-        HOOK_STDIN="$HOOK_STDIN$_line"
-        _line=""
-    done
-fi
-
-# The same deliberately narrow extractor post-tool-hook.sh uses, and for the
-# same reason: the key must be followed by nothing but whitespace and a colon
-# before the value's opening quote, so a `session_id` appearing inside some
-# other field is not mistaken for the field. It is a heuristic and is treated
-# as one — every result is validated below before anything is done with it.
-#
-# Taken over the key rather than hard-coded, because #339 needs a second field
-# — `source` — out of the same payload, and one heuristic is easier to reason
-# about than two copies of it. post-tool-hook.sh keeps its own single-key
-# copy: it reads one field, and sourcing a shared library from a hook that has
-# to survive a broken install is a worse trade than ten duplicated lines.
-_stdin_json_string() {
-    local key="$1" raw="$2" rest prefix value
-    case "$raw" in *"\"$key\""*) ;; *) return 1 ;; esac
-    rest=${raw#*\"$key\"}
-    prefix=${rest%%\"*}
-    case "$prefix" in *[!:[:space:]]*) return 1 ;; esac
-    value=${rest#*\"}
-    value=${value%%\"*}
-    [ -n "$value" ] || return 1
-    printf '%s' "$value"
-}
-
+# HOOK_STDIN was already captured, and _stdin_json_string already defined,
+# above -- ahead of resolve-paths.sh, since #411 -- so this only extracts.
 _stdin_session_id() {
     _stdin_json_string session_id "$1"
 }
@@ -165,6 +207,25 @@ CURRENT_SESSION_ID=$(_stdin_session_id "$HOOK_STDIN" 2>/dev/null) || CURRENT_SES
 case "$CURRENT_SESSION_ID" in
     ''|.|..|*[!A-Za-z0-9._-]*) CURRENT_SESSION_ID="" ;;
 esac
+
+# ── The transcript path the host handed us (#407) ─────────────────────────
+# Read from the same payload, exported for pipeline/host.transcript_path() to
+# pick up in any Python process this hook (or something it dispatches)
+# spawns. This is data from a host payload, same as CURRENT_SESSION_ID above,
+# and validated the same way: at the point of entry, not the point of use. A
+# transcript path legitimately contains slashes and dots, so it cannot share
+# that variable's character allowlist -- only a carriage return is rejected
+# here (a raw newline cannot reach this point at all: the read loop above
+# already strips every line terminator before HOOK_STDIN is assembled, so
+# the newline arm below is a belt no buckle can ever need -- kept rather
+# than dropped, in case a future change to that loop ever preserves one).
+# Whether the value actually names an openable file is decided on the Python
+# side, which falls back to the existing derivation when it does not.
+REMEMBER_TRANSCRIPT_PATH=$(_stdin_json_string transcript_path "$HOOK_STDIN" 2>/dev/null) || REMEMBER_TRANSCRIPT_PATH=""
+case "$REMEMBER_TRANSCRIPT_PATH" in
+    *$'\n'*|*$'\r'*) REMEMBER_TRANSCRIPT_PATH="" ;;
+esac
+export REMEMBER_TRANSCRIPT_PATH
 
 # ── Which KIND of SessionStart is this? (#339) ────────────────────────────
 # `source` is one of startup | resume | clear | compact | fork. It is read for
@@ -576,7 +637,7 @@ _remember_write_case_divergence() {
             # nobody reads. It is still never rendered as agreement anywhere
             # that reports it; `/remember:doctor` says it every time.
             [ "$_old" = "$_body" ] && return 0
-            log "case-divergence" "could not check whether this store is known by a second spelling (disk=$REMEMBER_CASE_DISK_STATE${REMEMBER_CASE_DISK_REASON:+/$REMEMBER_CASE_DISK_REASON} git=$REMEMBER_CASE_GIT_STATE${REMEMBER_CASE_GIT_REASON:+/$REMEMBER_CASE_GIT_REASON}) — this is not a report that they agree"
+            log "case-divergence" "could not check whether this store is known by a second spelling (disk=$REMEMBER_CASE_DISK_STATE${REMEMBER_CASE_DISK_REASON:+/$REMEMBER_CASE_DISK_REASON} git=$REMEMBER_CASE_GIT_STATE${REMEMBER_CASE_GIT_REASON:+/$REMEMBER_CASE_GIT_REASON}) -- this is not a report that they agree"
             ;;
     esac
     return 0
@@ -628,7 +689,16 @@ fi
 if [ "$(config '.features.recovery' true)" = "true" ]; then
 if [ -d "$SESSIONS_DIR" ] && [ -f "$LAST_SAVE_FILE" ] && [ -n "$PREV_ID" ]; then
     if [ "$PREV_WAS_SAVED" = "no" ]; then
-        "$PLUGIN_ROOT/scripts/save-session.sh" "$PREV_ID" --force </dev/null >/dev/null 2>&1 & disown 2>/dev/null || true
+        # REMEMBER_TRANSCRIPT_PATH (exported above, #407) names THIS session's
+        # own transcript -- it must not reach a save being forced for a
+        # DIFFERENT one. pipeline.extract.find_session() trusts that variable
+        # unconditionally once it names a real file, so an inherited value
+        # here would make PREV_ID's rescue silently read and summarize the
+        # current session's transcript instead, while still labelling the
+        # saved record PREV_ID. Cleared in a subshell so it stays exported for
+        # this hook's own later use. Pinned by
+        # tests/test_recovery_transcript_leak_407.py.
+        ( unset REMEMBER_TRANSCRIPT_PATH; "$PLUGIN_ROOT/scripts/save-session.sh" "$PREV_ID" --force ) </dev/null >/dev/null 2>&1 & disown 2>/dev/null || true
     fi
 fi
 fi
@@ -756,7 +826,7 @@ if [ -z "$CURRENT_SESSION_ID" ]; then
     # (#144, #263, #266). doctor reports the marker.
     printf '%s\n' "the SessionStart payload carried no usable session_id" \
         > "$CAPTURE_SKIPPED" 2>/dev/null || true
-    log "hook" "session-start: capture-gap check skipped — no session_id on stdin"
+    log "hook" "session-start: capture-gap check skipped -- no session_id on stdin"
 else
     rm -f "$CAPTURE_SKIPPED" 2>/dev/null || true
 
@@ -771,7 +841,7 @@ else
     if [ -n "$PREV_ID" ] && [ "$REPORTED_ID" != "$PREV_ID" ] \
        && ! capture_was_seen "$PREV_ID" \
        && grep -q '"tool_use"' "$PREV_JSONL" 2>/dev/null; then
-        echo "remember: your previous session was not captured. If you just installed or enabled the plugin, that is expected — capture starts now. Otherwise its hooks were not registered for that session; run /remember:doctor." \
+        echo "remember: your previous session was not captured. If you just installed or enabled the plugin, that is expected -- capture starts now. Otherwise its hooks were not registered for that session; run /remember:doctor." \
             > "$REMEMBER_DIR/tmp/capture-gap-notice" 2>/dev/null || true
         printf '%s' "$PREV_ID" > "$CAPTURE_REPORTED" 2>/dev/null || true
     fi
@@ -792,17 +862,78 @@ fi
 CORE_MEMORIES="$REMEMBER_DIR/core-memories.md"
 REMEMBER_RECENT="$REMEMBER_DIR/recent.md"
 REMEMBER_ARCHIVE="$REMEMBER_DIR/archive.md"
-REMEMBER_HANDOFF="$REMEMBER_DIR/remember.md"
 REMEMBER_NOW="$REMEMBER_DIR/now.md"
 REMEMBER_TODAY_FILE="$REMEMBER_DIR/today-${TODAY}.md"
 
+# ── Handoff path: single (default) vs per-session (#363) ──────────────────
+# Two or more INTERACTIVE sessions share one project store by design, even
+# across git worktrees (_resolve_memory_project_dir, #56) — but the handoff
+# was always one fixed file. The second session's /remember silently
+# overwrote the first's, which then survived only in that session's own
+# transcript, nowhere on disk. Distinct from #221/#222: those protect a
+# PENDING handoff from a session that never writes one back; this is two
+# sessions that each DO write one, to the same name.
+#
+# `handoff_mode` defaults to "single" — today's path, byte-identical — so an
+# existing install's behaviour never changes underneath it. That means the
+# clobber is not fixed in the field until a user opts in, and that trade is
+# deliberate: every other behaviour-changing key in this file defaults off
+# (data_dir, git_restore.enabled, reject_pattern) rather than rewriting an
+# existing store's layout the moment a new version is installed.
+#
+# Per-session mode needs CURRENT_SESSION_ID (#270, sanitized above) to name
+# the file. Its absence must never silently fall back to the shared name —
+# that fallback IS the bug this exists to fix, only quieter, because the
+# user believes per_session is protecting them. So an unresolved session id
+# under a per_session request still resolves REMEMBER_HANDOFF to the shared
+# file (nothing else this hook can do with no name to give it), but the
+# hint below is withheld rather than pointed at it: the /remember skill's
+# own hardcoded legacy fallback is the only thing that can still write
+# there, and doing so leaves "no HANDOFF hint was given" visible in the
+# transcript instead of a namespaced-looking path that never actually
+# applied.
+HANDOFF_MODE=$(config ".handoff_mode" "single")
+PER_SESSION_HANDOFF=""
+HANDOFF_MODE_DEGRADED=""
+if [ "$HANDOFF_MODE" = "per_session" ] && [ -n "$CURRENT_SESSION_ID" ]; then
+    REMEMBER_HANDOFF="$REMEMBER_DIR/remember.${CURRENT_SESSION_ID}.md"
+    PER_SESSION_HANDOFF="true"
+else
+    REMEMBER_HANDOFF="$REMEMBER_DIR/remember.md"
+    # per_session was asked for and could not be honoured — record that this
+    # session degraded to the shared file so the hint below can withhold
+    # rather than point the skill at it as though isolation had applied.
+    [ "$HANDOFF_MODE" = "per_session" ] && HANDOFF_MODE_DEGRADED="true"
+fi
+
 # ── Handoff path hint (consumed by the /remember skill) ───────────────────
-# Emitted only in external mode. In legacy mode REMEMBER_HANDOFF resolves to
-# {project}/.remember/remember.md — the exact path the skill defaults to when
-# no === HANDOFF === block is present, so the hint would be pure noise.
-if [ "$REMEMBER_ROOT" != "$PROJECT_DIR" ]; then
+# Emitted in external mode (unchanged, #56/#296) OR whenever this session
+# resolved a per-session path — in LEGACY per_session mode REMEMBER_HANDOFF
+# no longer equals the skill's own hardcoded fallback, so the hint stops
+# being noise and becomes the only thing that points the skill at the
+# right file.
+#
+# NOT withheld on degrade. An earlier version of this hook suppressed the
+# hint outright whenever per_session was requested but had no usable
+# session id, reasoning that pointing at the shared file under a mode
+# claiming isolation was a lie. That reasoning was wrong in external mode:
+# REMEMBER_HANDOFF still resolves to the one real external path there, so
+# the hint is exactly as accurate as it always was, and withholding it
+# reintroduced the bug the ORIGINAL external-mode hint existed to prevent —
+# the /remember skill falling back to its hardcoded, project-relative
+# default instead of the real external location. A reviewer of #363 caught
+# this before it shipped.
+#
+# The honest fix is not silence, it is a visible line: when degraded, the
+# hint still fires with the correct path, and a second line says so, so
+# a user who set per_session does not read "namespaced" behaviour into a
+# session that never got one.
+if [ "$REMEMBER_ROOT" != "$PROJECT_DIR" ] || [ -n "$PER_SESSION_HANDOFF" ]; then
     echo "=== HANDOFF ==="
     echo "Write next handoff to: $REMEMBER_HANDOFF"
+    if [ -n "$HANDOFF_MODE_DEGRADED" ]; then
+        echo "(handoff_mode is \"per_session\", but no session_id reached this hook -- writing to the shared file above, not a per-session one.)"
+    fi
     echo ""
 fi
 
@@ -846,10 +977,22 @@ fi
 # start, and no merge driver repairs that: union emits both key sets and yields
 # a malformed record, so this is the one file in the store where "keep both
 # sides" is wrong.
-REMEMBER_HANDOFF_STATE="$REMEMBER_DIR/tmp/remember.delivered"
+# Per-session in per_session mode (#363) — REMEMBER_HANDOFF is now one file
+# per session, and two sessions racing the SAME delivery record would corrupt
+# it (a torn write, or one session's fingerprint overwriting another's) even
+# though each has its own handoff to track. In single mode this is exactly
+# the pre-#363 shared path.
+if [ -n "$PER_SESSION_HANDOFF" ]; then
+    REMEMBER_HANDOFF_STATE="$REMEMBER_DIR/tmp/remember.delivered.${CURRENT_SESSION_ID}"
+else
+    REMEMBER_HANDOFF_STATE="$REMEMBER_DIR/tmp/remember.delivered"
+fi
 
 # Carry an existing record to its new home rather than resetting it — this
-# machine's delivery history is still true about this machine.
+# machine's delivery history is still true about this machine. Legacy-record
+# migration is single-mode only: the old un-namespaced record predates #363
+# entirely, so it has nothing meaningful to say about any one session's
+# per-session slot, and per_session installs are new enough that none exists.
 #
 # The MOVE is also what retires the tracked copy. An ignore rule does nothing to
 # a file git already tracks, and a `git rm --cached` whose path still exists in
@@ -860,14 +1003,16 @@ REMEMBER_HANDOFF_STATE="$REMEMBER_DIR/tmp/remember.delivered"
 #
 # A record arriving from a pull is DISCARDED, never adopted: it describes some
 # other machine's sessions, and it is the reason this issue exists.
-_REMEMBER_HANDOFF_STATE_LEGACY="$REMEMBER_DIR/remember.delivered"
-if [ -f "$_REMEMBER_HANDOFF_STATE_LEGACY" ]; then
-    if [ -f "$REMEMBER_HANDOFF_STATE" ]; then
-        rm -f "$_REMEMBER_HANDOFF_STATE_LEGACY" 2>/dev/null
-    else
-        mkdir -p "$REMEMBER_DIR/tmp" 2>/dev/null
-        mv "$_REMEMBER_HANDOFF_STATE_LEGACY" "$REMEMBER_HANDOFF_STATE" 2>/dev/null \
-            || rm -f "$_REMEMBER_HANDOFF_STATE_LEGACY" 2>/dev/null
+if [ -z "$PER_SESSION_HANDOFF" ]; then
+    _REMEMBER_HANDOFF_STATE_LEGACY="$REMEMBER_DIR/remember.delivered"
+    if [ -f "$_REMEMBER_HANDOFF_STATE_LEGACY" ]; then
+        if [ -f "$REMEMBER_HANDOFF_STATE" ]; then
+            rm -f "$_REMEMBER_HANDOFF_STATE_LEGACY" 2>/dev/null
+        else
+            mkdir -p "$REMEMBER_DIR/tmp" 2>/dev/null
+            mv "$_REMEMBER_HANDOFF_STATE_LEGACY" "$REMEMBER_HANDOFF_STATE" 2>/dev/null \
+                || rm -f "$_REMEMBER_HANDOFF_STATE_LEGACY" 2>/dev/null
+        fi
     fi
 fi
 
@@ -904,11 +1049,28 @@ if [ -f "$REMEMBER_HANDOFF" ] && [ -s "$REMEMBER_HANDOFF" ]; then
 
     echo "=== LAST HANDOFF ==="
     if [ -n "$PREV_FP" ] && [ "$HANDOFF_FP" = "$PREV_FP" ]; then
-        # 10# after the case (#332). The record is explicitly hand-editable,
-        # which is the premise of the guard above and the one source that can
-        # deliver "08".
-        DELIVERIES=$((10#$DELIVERIES + 1))
-        echo "[already delivered ${DELIVERIES} times since ${FIRST_DELIVERED:-an earlier session} — no new handoff has been written since, so this is pending replacement, not news. You may already have acted on it. Running /remember replaces it.]"
+        # The counter's own wording ("already delivered N times") is a claim
+        # about how many SESSIONS have seen this content — but `SessionStart`
+        # fires on every source, including `compact`, which is not a new
+        # session at all (#206 settled this for the capture-alive store; #341
+        # is that rule applied here). Without the guard below, four
+        # auto-compactions of a handoff delivered exactly once read as
+        # "already delivered 5 times", arguing for dismissing content that
+        # was in fact read once.
+        #
+        # `compact` is the only source excluded. `clear`, `fork`, `resume`, an
+        # absent source and an unrecognised value are NOT: each already means
+        # something happened that plausibly warrants treating the fire as a
+        # fresh look — `clear` genuinely replaces the context, and the #339
+        # safe direction for an unknown/absent source is to change nothing.
+        # `compact` is the one source that is provably still the same session.
+        if [ "$SESSION_START_SOURCE" != "compact" ]; then
+            # 10# after the case (#332). The record is explicitly
+            # hand-editable, which is the premise of the guard above and the
+            # one source that can deliver "08".
+            DELIVERIES=$((10#$DELIVERIES + 1))
+        fi
+        echo "[already delivered ${DELIVERIES} times since ${FIRST_DELIVERED:-an earlier session} -- no new handoff has been written since, so this is pending replacement, not news. You may already have acted on it. Running /remember replaces it.]"
     else
         DELIVERIES=1
         FIRST_DELIVERED=$(_remember_date '+%Y-%m-%d %H:%M')
@@ -923,6 +1085,127 @@ elif [ -f "$REMEMBER_HANDOFF_STATE" ]; then
     # describes content that no longer exists, and keeping it would mislabel a
     # future handoff that happens to fingerprint the same.
     rm -f "$REMEMBER_HANDOFF_STATE"
+fi
+
+# ── Prune stale per-session delivery records (#373) ───────────────
+# handoff_mode: per_session writes one remember.delivered.<session_id> per
+# session (above) and nothing else in this codebase ever removes one -- the
+# same class of leak #362 already fixed once, in the same directory, under a
+# different filename ("could not tell" was not a state that leak had; this
+# one does, because a delivery record's own session might still be live).
+#
+# Coupling this to the paired remember.<session_id>.md handoff slot was
+# considered and rejected: that slot survives forever ON PURPOSE (#221), so a
+# sweep keyed to it would reintroduce unbounded growth under a new name.
+# Coupled instead to the one fact that actually answers "is this session
+# over": whether Claude Code's own transcript for that session id still
+# exists under $SESSIONS_DIR -- the same directory `previous_transcript`
+# above already reads. A transcript still on disk means the session could
+# still resume and write another handoff; one that is gone means the session
+# is gone in every way this hook can observe.
+#
+# Three states, not two, matching the record left behind:
+#   - transcript confirmed ABSENT, record older than GRACE_MIN -> pruned
+#   - transcript confirmed PRESENT -> record is kept (not a bug: correct
+#     under the coupling above)
+#   - transcript ABSENT but record younger than GRACE_MIN, or $SESSIONS_DIR
+#     cannot be listed at all -> nothing is touched. Could-not-tell must
+#     never render as either of the other two, so on doubt the safe
+#     direction is the one #221 already chose for the handoff itself: keep,
+#     never guess-delete.
+#
+# #393: "transcript absent" alone does not mean "session gone". At
+# source=startup (see the #270 comment above, lines 100-108) Claude Code
+# creates a session's own transcript AFTER this hook has already run and
+# already written that session's delivery record (line ~1012 above). For
+# that window a live session's record is indistinguishable from a dead
+# one's on the transcript check alone -- any concurrent session start
+# would prune a record that is still in active use. GRACE_MIN arbitrates:
+# a record newer than the window is not evidence the session is over,
+# whatever the transcript says; the mtime check below is what makes this a
+# third state instead of a coin flip. GRACE_MIN is REASONED, not measured
+# against real Claude Code startup timing -- there is no instrumented
+# figure for how long that gap runs, so this picks a duration wide enough
+# that no plausible hook-to-transcript-creation delay approaches it, while
+# staying bounded: a genuinely dead session's record is still pruned, just
+# on the next session start after it ages past this window, never lost.
+GRACE_MIN=5
+#
+# Runs regardless of THIS session's own handoff_mode -- not gated on
+# $PER_SESSION_HANDOFF. Gating it there was considered and rejected: a
+# record left behind during a PAST per_session period does not stop
+# existing the moment a user switches handoff_mode back to "single", and a
+# sweep that only ran while per_session was the CURRENT setting would leak
+# exactly those records forever -- the same accumulation this fix exists to
+# stop, just gated behind a config toggle instead of eliminated.
+#
+# Legacy (un-namespaced) mode never matches the glob below regardless: it
+# only ever matches "remember.delivered.<something>", and the shared-mode
+# file is exactly "remember.delivered" with no trailing dot.
+if [ -d "$SESSIONS_DIR" ] && [ -d "$REMEMBER_DIR/tmp" ]; then
+    for _remember_stale_record in "$REMEMBER_DIR"/tmp/remember.delivered.*; do
+        [ -f "$_remember_stale_record" ] || continue
+        _remember_stale_id="${_remember_stale_record##*/remember.delivered.}"
+        [ -n "$_remember_stale_id" ] || continue
+        # Never sweep the record this very invocation just wrote.
+        [ "$_remember_stale_id" = "$CURRENT_SESSION_ID" ] && continue
+        if [ ! -e "$SESSIONS_DIR/$_remember_stale_id.jsonl" ]; then
+            # #393: an absent transcript is not proof the session is over --
+            # it is also what a session still inside its own startup window
+            # looks like. Read the record's own mtime rather than shelling
+            # out to `find -mmin`: `find` is the one command on this path
+            # with a real PATH-shadowing risk on Windows Git Bash
+            # (System32's find.exe can resolve ahead of MinGW's find on
+            # some setups and silently answers a different question), so it
+            # would degrade "prune" into a silent always-keep with nothing
+            # surfaced. `stat` uses the same GNU-first-then-BSD-fallback
+            # order already used by doctor.sh:257 and lib-lock.sh:183 for
+            # exactly this portability split -- GNU first, because GNU
+            # `stat -f` on Linux pollutes stdout with a filesystem block
+            # before failing (the #327/#1072 class), so trying it second,
+            # only after `-c` has already failed cleanly, is load-bearing
+            # order and not a stylistic choice.
+            _remember_stale_mtime=$(stat -c %Y "$_remember_stale_record" 2>/dev/null) \
+                || _remember_stale_mtime=$(stat -f %m "$_remember_stale_record" 2>/dev/null) \
+                || _remember_stale_mtime=""
+            # Empty (stat failed outright) and non-numeric (stat exited 0 but
+            # printed something that is not a timestamp) are both
+            # could-not-tell, same safe direction as an unreadable
+            # $SESSIONS_DIR above -- caught in the same `case` so a
+            # non-empty garbage read cannot be coerced to 0 and then treated
+            # by the -gt 0 gate below as a confirmed, comparable age (found
+            # during #402's own review: the previous split of this check
+            # only caught the fully-empty shape, and the -gt 0 gate does not
+            # tell "confirmed zero" apart from "coerced from garbage").
+            case "$_remember_stale_mtime" in
+                (''|*[!0-9]*)
+                    continue
+                    ;;
+            esac
+            # _remember_date +%s -- same call site convention as
+            # post-tool-hook.sh:377/605. lib-clock.sh routes %s to `date`
+            # unconditionally (never the printf builtin), and `_remember_date`
+            # itself already falls back to plain `date` with no TZ set, so
+            # this is not expected to fail on this path -- but #402 found
+            # that when it does (empty output, or a non-numeric one), the
+            # -gt 0 gates below silently coerced "could not read the clock"
+            # into "confirmed outside the grace window", the opposite of
+            # what an unreadable mtime does three lines above. Refuse to
+            # guess in either failure shape, same as the mtime check does.
+            _remember_now=$(_remember_date +%s)
+            case "$_remember_now" in
+                (''|*[!0-9]*)
+                    continue
+                    ;;
+            esac
+            if [ "$_remember_now" -gt 0 ] && [ "$_remember_stale_mtime" -gt 0 ] \
+                && [ $((10#$_remember_now - 10#$_remember_stale_mtime)) -lt $((GRACE_MIN * 60)) ]; then
+                continue
+            fi
+            rm -f "$_remember_stale_record" 2>/dev/null
+        fi
+    done
+    unset _remember_stale_record _remember_stale_id _remember_stale_mtime _remember_now GRACE_MIN
 fi
 
 # ── History hint ───────────────────────────────────────────────────────────
@@ -1099,8 +1382,18 @@ fi
 
 # ── Consolidation trigger ─────────────────────────────────────────────────
 # If past-day staging files exist, compress them in the background.
+#
+# Gated on source (#342): `compact` fires mid-session and changes nothing
+# about whether yesterday's staging is worth compressing — the #339 report
+# measured `compact` re-triggering this 82 times across 50 sessions, against
+# `startup`'s 180, all spawning the same work again. `compact` is excluded
+# for the same reason #341 excludes it from the delivery counter: it is
+# provably not a new entry point into the session. `startup`, `resume`,
+# `clear`, `fork`, an absent source and an unrecognised value are left
+# triggering exactly as before — narrowing further would mean staging files
+# wait indefinitely for a session that never does a bare `startup` again.
 STAGING_COUNT=$(ls "$REMEMBER_DIR/today-"*.md 2>/dev/null | grep -v "today-${TODAY}.md" | grep -v "\.done\.md" | wc -l | tr -d ' ')
-if [ "$STAGING_COUNT" -gt 0 ]; then
+if [ "$STAGING_COUNT" -gt 0 ] && [ "$SESSION_START_SOURCE" != "compact" ]; then
     echo "=== MEMORY CONSOLIDATION ==="
     echo "$STAGING_COUNT day(s) of memory to compress. Running consolidation in background..."
     nohup "$PLUGIN_ROOT/scripts/run-consolidation.sh" </dev/null >/dev/null 2>&1 & disown 2>/dev/null || true

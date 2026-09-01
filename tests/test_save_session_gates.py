@@ -20,7 +20,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +60,7 @@ if cmd == "extract":
     print("ASSISTANT_COUNT=1")
     print(f"EXCHANGE_COUNT={os.environ['STUB_EXCHANGE_COUNT']}")
     print(f"EXTRACT_FILE={path}")
+    print(f"ENVELOPE={os.environ.get('STUB_ENVELOPE', 'claude-code')}")
 elif cmd == "save-position":
     last_save_file, session_id, position = sys.argv[2], sys.argv[3], sys.argv[4]
     import json
@@ -146,6 +147,11 @@ elif cmd == "call-haiku":
     print("IS_SKIP=" + ("true" if (rejected or (not is_ndc and skipping)) else "false"))
     print("IS_REJECTED=" + ("true" if rejected else "false"))
     print(f"HAIKU_TEXT_FILE={path}")
+    # Which route produced this (#460/#461) -- defaults to "claude" so every
+    # pre-#460 test in this file, which never sets STUB_PROVIDER, is
+    # unaffected: save-session.sh reads it with the same ${PROVIDER:-claude}
+    # fallback the real pipeline.shell always overrides on a live call.
+    print(f"PROVIDER={os.environ.get('STUB_PROVIDER', 'claude')}")
     print("TK_IN=0"); print("TK_OUT=0"); print("TK_CACHE=0"); print("TK_COST=0")
 elif cmd == "build-ndc-prompt":
     # Must be non-empty: save-session.sh gates the NDC run on `[ -s ... ]`.
@@ -155,7 +161,7 @@ elif cmd == "build-ndc-prompt":
 
 
 def _make_env(tmp_path: Path, *, exchanges: int, humans: int, position: int = 500,
-              config: Optional[dict] = None):
+              config: Optional[dict] = None, envelope: str = "claude-code"):
     """Build a project + stub plugin and return the env for running save-session.sh."""
     project = tmp_path / "project"
     (project / ".remember" / "tmp").mkdir(parents=True)
@@ -203,6 +209,7 @@ def _make_env(tmp_path: Path, *, exchanges: int, humans: int, position: int = 50
         "STUB_POSITION": str(position),
         "STUB_HUMAN_COUNT": str(humans),
         "STUB_EXCHANGE_COUNT": str(exchanges),
+        "STUB_ENVELOPE": envelope,
         "STUB_MEMORY_FILE": str(project / ".remember" / "now.md"),
         # Keep the clock on `date`, where a PATH shim can still reach it (#227).
         #
@@ -288,6 +295,12 @@ def _suppress_ndc(project: Path):
     (project / ".remember" / "tmp" / "last-ndc.ts").write_text(str(int(time.time())))
 
 
+def _memory_log_text(project: Path) -> str:
+    log_dir = project / ".remember" / "logs"
+    logs = sorted(log_dir.glob("memory-*.log")) if log_dir.is_dir() else []
+    return logs[-1].read_text() if logs else ""
+
+
 class TestNoWorkSessionAdvancesPosition:
 
     def test_zero_exchanges_advances_position(self, tmp_path):
@@ -302,6 +315,36 @@ class TestNoWorkSessionAdvancesPosition:
             "the same lines and exits identically, once per cooldown, forever"
         )
         assert "call-haiku" not in calls.read_text(), "no summary should be attempted"
+
+    def test_zero_exchanges_logs_the_ordinary_message_for_a_known_envelope(self, tmp_path):
+        """Positive control for the test below: a genuinely quiet Claude Code
+        span still gets the plain "0 exchanges" wording, not the unrecognised
+        one -- so the two log messages are provably distinguishable rather
+        than the unrecognised-envelope test only checking a stub that always
+        prints the same thing (#443)."""
+        env, project, plugin, calls, sid = _make_env(tmp_path, exchanges=0, humans=0,
+                                                     position=5, envelope="claude-code")
+        result = _run(plugin, env, sid)
+
+        assert result.returncode == 0, subprocess_failure_detail(result, project / ".remember")
+        log_text = _memory_log_text(project)
+        assert "0 exchanges" in log_text
+        assert "unrecognised" not in log_text
+
+    def test_unrecognised_envelope_is_logged_loud_not_as_a_quiet_session(self, tmp_path):
+        """A transcript shape neither known host wrote must be reported as
+        unrecognised in the log -- not silently folded into the same "0
+        exchanges" wording a genuinely empty session gets, which is the exact
+        silent failure #443 exists to prevent. Position still advances: there
+        is nothing more this run can do with an unreadable transcript."""
+        env, project, plugin, calls, sid = _make_env(tmp_path, exchanges=0, humans=0,
+                                                     position=5, envelope="unrecognised")
+        result = _run(plugin, env, sid)
+
+        assert result.returncode == 0, subprocess_failure_detail(result, project / ".remember")
+        log_text = _memory_log_text(project)
+        assert "unrecognised" in log_text, log_text
+        assert _saved_position(project) == 5
 
 
 class TestMinHumanGate:
@@ -448,7 +491,16 @@ class TestHeaderTimeIsTakenBackOffTheModel:
 
     def test_a_wrong_time_is_overwritten_with_the_scripts_own(self, tmp_path):
         env, project, plugin, calls, sid = _make_env(tmp_path, exchanges=6, humans=5)
-        env["STUB_HAIKU_TEXT"] = "## 18:30 | main\n\n- did some work\n"
+        # A literal "18:30" is wrong only when the script's own clock does not
+        # also read 18:30 -- true 1439 minutes out of 1440, and false often
+        # enough that two unrelated PRs failed this exact assertion in the
+        # same minute (#383). An hour back, wrapping through midnight via
+        # timedelta, is wrong by construction: it stays wrong across the
+        # whole test run and across any minute (or hour) rollover between
+        # this read and the script's own, by a margin no such rollover can
+        # close.
+        wrong_time = (datetime.now() - timedelta(hours=1)).strftime("%H:%M")
+        env["STUB_HAIKU_TEXT"] = f"## {wrong_time} | main\n\n- did some work\n"
         _suppress_ndc(project)
         result = _run(plugin, env, sid)
         assert result.returncode == 0, subprocess_failure_detail(result, project / ".remember")
@@ -460,6 +512,13 @@ class TestHeaderTimeIsTakenBackOffTheModel:
         corrected = re.search(r"header time corrected to (\S+)", logs).group(1)
         assert header == f"## {corrected} | main", (
             f"header kept the model's time instead of the script's: {header!r}"
+        )
+        # Positive control: the phrase alone is not enough, since a harness
+        # that logged "header time corrected" unconditionally would also
+        # pass the assertion above. The corrected time must actually differ
+        # from the deliberately-wrong one fed in.
+        assert corrected != wrong_time, (
+            f"logged a correction but to the same wrong time: {corrected!r}"
         )
 
     def test_the_branch_and_body_survive_the_rewrite(self, tmp_path):

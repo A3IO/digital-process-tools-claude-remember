@@ -21,10 +21,25 @@
 #   --dry          Preview mode — show extracted exchanges, do not call Haiku
 #
 # ENVIRONMENT
-#   REMEMBER_DEBUG   Set to "1"/"0" for verbose logging. Unset, the `debug`
-#                    config option decides; unset there too, this script is
-#                    verbose (its long-standing default) while the git-backup
-#                    hook is quiet.
+#   REMEMBER_DEBUG            Set to "1"/"0" for verbose logging. Unset, the
+#                             `debug` config option decides; unset there too,
+#                             this script is verbose (its long-standing
+#                             default) while the git-backup hook is quiet.
+#   REMEMBER_TRANSCRIPT_PATH  Trusted input for a manual run (#431). When set,
+#                             pipeline.host.transcript_path() hands it to
+#                             find_session() verbatim -- existence-checked
+#                             only, no containment check -- the same as the
+#                             hook-spawned path this script normally runs on.
+#                             session-start-hook.sh and session-end-hook.sh
+#                             export it freshly, from their own validated
+#                             stdin payload, on every run; post-tool-hook.sh
+#                             and user-prompt-hook.sh (which spawn this script
+#                             with no transcript_path of their own to offer)
+#                             clear it before doing anything else (#424/#430).
+#                             This script does neither: run by hand, it
+#                             inherits whatever your shell already holds,
+#                             deliberately. Unset it yourself before a manual
+#                             run if you do not want that.
 #
 # DEPENDENCIES
 #   python3, claude CLI (Haiku), git, date, mktemp
@@ -101,18 +116,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Lock (mkdir acquisition, rename-based stale takeover — see lib-lock.sh) ---
-# Timeout 0: a save that loses the race skips rather than queues. Two saves of
-# the same session back to back have nothing to add to each other, and the next
-# tool call brings another one along in seconds.
-if lock_acquire "$LOCK_DIR" 0; then
-    HAVE_LOCK=true
-else
-    debug_enabled 1 && log "lock" "another save holds the lock, skipping"
-    exit 0
-fi
-
 # --- Parse args ---
+# Moved ahead of lock acquisition (#369): --force has to be known BEFORE the
+# lock is taken, because the two callers need different acquisition
+# strategies (see below), and reading argv has no side effect that ordering
+# could break.
 DRY_RUN=false
 FORCE=false
 SESSION_ID=""
@@ -123,6 +131,55 @@ for arg in "$@"; do
         *)       SESSION_ID="$arg" ;;
     esac
 done
+
+# --- Lock (mkdir acquisition, rename-based stale takeover — see lib-lock.sh) ---
+# Two acquisition strategies, not one (#369). A PLAIN call (post-tool-hook.sh's
+# background fork, or a bare `save-session.sh <id>`) still uses timeout 0: a
+# save that loses the race skips rather than queues, because two saves of the
+# same session back to back have nothing to add to each other and the next
+# tool call brings another one along in seconds. That reasoning does not carry
+# over to --force. session-end-hook.sh forks `save-session.sh --force` as the
+# session's LAST chance to flush, moments after post-tool-hook.sh's own
+# background save may have just taken the lock for the same span — timeout 0
+# then loses a race it was never trying to win, and used to exit 0 having
+# saved nothing, indistinguishable from a genuine no-op.
+#
+# So a FORCED call waits, bounded, instead of failing on contact: long enough
+# to outlast an ordinary save (NDC's own commit-lock wait is 30s, reused here
+# as the same order of magnitude — see NDC_COMMIT_LOCK_TIMEOUT above), short
+# enough not to hang the session-end hook, which backgrounds this call
+# specifically so a slow flush cannot block Claude Code's own hook timeout
+# (see session-end-hook.sh). Env-overridable so a test can drive the timeout
+# path without waiting out the real default, same shape as
+# REMEMBER_NDC_COMMIT_LOCK_TIMEOUT above.
+#
+# This is a bounded RETRY, not a second writer: --force still waits for the
+# SAME mutex, never bypasses it. Two concurrent writers to now.md was
+# considered and rejected — that reintroduces the #142/#168 class of bug this
+# lock exists to prevent, to buy back a race that a longer wait already
+# closes in the overwhelming majority of cases.
+#
+# The failure that remains — the holder outlives even this wait — must not be
+# silent (#369's actual complaint). It exits 1, distinct from the plain
+# path's exit 0, and session-end-hook.sh already checks that exit code and
+# calls report_error on nonzero: this makes that existing check see the
+# failure instead of a false all-clear.
+FORCE_LOCK_TIMEOUT="${REMEMBER_FORCE_LOCK_TIMEOUT:-30}"
+if [ "$FORCE" = true ]; then
+    if lock_acquire "$LOCK_DIR" "$FORCE_LOCK_TIMEOUT"; then
+        HAVE_LOCK=true
+    else
+        log "lock" "ERROR: --force waited ${FORCE_LOCK_TIMEOUT}s for save.lock and another save still held it -- nothing was flushed this call"
+        exit 1
+    fi
+else
+    if lock_acquire "$LOCK_DIR" 0; then
+        HAVE_LOCK=true
+    else
+        debug_enabled 1 && log "lock" "another save holds the lock, skipping"
+        exit 0
+    fi
+fi
 
 SESSION_DIR_PATH="$(claude_projects_dir)/$(session_dir_slug "$PROJECT_DIR")"
 if [ -z "$SESSION_ID" ]; then
@@ -196,7 +253,7 @@ if [ -f "$COOLDOWN_MARKER" ] && [ "$DRY_RUN" != true ] && [ "$FORCE" != true ]; 
         # PROCEED, reset, and SAY SO -- three states, not two. Clamping in
         # silence would trade a mute stuck throttle for a mute wrong value,
         # which is the same defect one layer along.
-        report_error "cooldown" "WARNING: $COOLDOWN_MARKER is $(( 0 - ELAPSED ))s ahead of now — the clock moved back, or the marker is corrupt in a way a digits-only check cannot see. Resetting it and saving; the cooldown resumes from now."
+        report_error "cooldown" "WARNING: $COOLDOWN_MARKER is $(( 0 - ELAPSED ))s ahead of now -- the clock moved back, or the marker is corrupt in a way a digits-only check cannot see. Resetting it and saving; the cooldown resumes from now."
         date +%s > "$COOLDOWN_MARKER" 2>/dev/null || true
     elif [ "$ELAPSED" -lt "$SAVE_COOLDOWN" ]; then
         debug_enabled 1 && log "cooldown" "${ELAPSED}s < ${SAVE_COOLDOWN}s, skip"
@@ -212,7 +269,14 @@ log "extract" "session $SESSION_ID"
 safe_eval <<< "$(cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell extract "$SESSION_ID" "$PROJECT_DIR")"
 CLEANUP_FILES+=("$EXTRACT_FILE")
 date +%s > "$COOLDOWN_MARKER"
-log "extract" "${EXCHANGE_COUNT} exchanges (${HUMAN_COUNT} human)"
+if [ "$ENVELOPE" = "unrecognised" ]; then
+    # A transcript shape neither Claude Code nor Codex wrote -- NOT a quiet
+    # session. Reporting it as "0 exchanges" would be indistinguishable from
+    # one, which is exactly the silent failure #443 exists to prevent.
+    log "extract" "unrecognised transcript envelope, 0 exchanges read (not a quiet session -- see pipeline/host.sniff_envelope)"
+else
+    log "extract" "${EXCHANGE_COUNT} exchanges (${HUMAN_COUNT} human)"
+fi
 
 # Nothing in this span at all: advance the saved position before leaving (#147).
 # The position is only written after a *successful* save (:211), so an early exit
@@ -220,12 +284,29 @@ log "extract" "${EXCHANGE_COUNT} exchanges (${HUMAN_COUNT} human)"
 # :131 *is* written, the next run re-extracted the identical span and exited
 # identically, once per cooldown window, forever. There is nothing to summarize
 # in an empty span, so advancing loses no memory and breaks the loop.
+#
+# "unrecognised" is NOT the same zero as a genuinely quiet session (#450): the
+# span was never actually read, only skipped, so simply advancing here would
+# make it unrecoverable the moment a later build learns to parse this
+# envelope. The position still advances -- that is what keeps #147's loop
+# closed -- but $ENVELOPE and $SKIP_LINES ride along to `save-position`,
+# which quarantines the span (in unread-envelope.json, keyed by session) at
+# its earliest still-unread point instead of losing it. A future run of THIS
+# session, once its envelope is recognised, resumes extraction from the
+# quarantine point rather than from $POSITION, and the quarantine is cleared
+# the moment that happens. See pipeline.extract.mark_unread_envelope /
+# clear_unread_envelope and pipeline.shell.cmd_save_position for the other
+# half.
 if [ "$EXCHANGE_COUNT" -eq 0 ]; then
     if [ "$DRY_RUN" = false ]; then
-        log "extract" "0 exchanges, skip — position → $POSITION"
-        cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION"
+        if [ "$ENVELOPE" = "unrecognised" ]; then
+            log "extract" "unrecognised envelope, skip -- position -> $POSITION (span quarantined from line $SKIP_LINES for a future build)"
+        else
+            log "extract" "0 exchanges, skip -- position -> $POSITION"
+        fi
+        cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION" "$ENVELOPE" "$SKIP_LINES"
     else
-        log "extract" "0 exchanges, skip (dry run — position unchanged)"
+        log "extract" "0 exchanges, skip (dry run -- position unchanged)"
     fi
     exit 0
 fi
@@ -277,14 +358,14 @@ fi
 # and can be. Same trade as the NDC tail arm below (see Step 8) — report the
 # read you could not make, do not act on a value you do not have.
 NO_PREVIOUS_ENTRY="(no previous entry)"
-LAST_ENTRY_UNAVAILABLE="(previous entry unavailable — now.md could not be read; earlier work may already be recorded)"
+LAST_ENTRY_UNAVAILABLE="(previous entry unavailable -- now.md could not be read; earlier work may already be recorded)"
 TMP_LAST_ENTRY=$(mktemp "${TMPDIR:-/tmp}"/remember-last-entry-XXXXXX)
 CLEANUP_FILES+=("$TMP_LAST_ENTRY")
 if [ ! -f "$MEMORY_FILE" ]; then
     printf '%s\n' "$NO_PREVIOUS_ENTRY" > "$TMP_LAST_ENTRY"
 elif [ ! -r "$MEMORY_FILE" ]; then
     printf '%s\n' "$LAST_ENTRY_UNAVAILABLE" > "$TMP_LAST_ENTRY"
-    log "prompt" "ERROR: now.md exists but is not readable — last entry sent as unavailable, not as absent"
+    log "prompt" "ERROR: now.md exists but is not readable -- last entry sent as unavailable, not as absent"
 else
     # `grep -n ... | tail -1 | cut` reported the exit status of `cut`, which
     # succeeds on empty input, so grep failing on an unreadable or vanished
@@ -296,7 +377,7 @@ else
     LAST_ENTRY_HEADERS=$(grep -n '^## ' "$MEMORY_FILE") || HEADER_GREP_RC=$?
     if [ "$HEADER_GREP_RC" -gt 1 ]; then
         printf '%s\n' "$LAST_ENTRY_UNAVAILABLE" > "$TMP_LAST_ENTRY"
-        log "prompt" "ERROR: header search over now.md failed (grep rc ${HEADER_GREP_RC}) — last entry sent as unavailable, not as absent"
+        log "prompt" "ERROR: header search over now.md failed (grep rc ${HEADER_GREP_RC}) -- last entry sent as unavailable, not as absent"
     else
         LAST_LINE="${LAST_ENTRY_HEADERS##*$'\n'}"
         LAST_LINE="${LAST_LINE%%:*}"
@@ -311,7 +392,7 @@ else
             # cannot stand behind, and a mid-word truncation reads to the
             # summarizer as content rather than as damage.
             printf '%s\n' "$LAST_ENTRY_UNAVAILABLE" > "$TMP_LAST_ENTRY"
-            log "prompt" "ERROR: reading the last entry from now.md failed — sent as unavailable, not as absent (this save may duplicate work already recorded)"
+            log "prompt" "ERROR: reading the last entry from now.md failed -- sent as unavailable, not as absent (this save may duplicate work already recorded)"
         fi
     fi
 fi
@@ -374,12 +455,12 @@ record_summary_failure() {
     fi
 
     if [ "$_count" -ge "$MAX_FAILURES" ]; then
-        log "haiku" "WARNING: ${_count} consecutive failures on this span — dropping it unsummarized and advancing position → $POSITION (see thresholds.max_summary_failures)"
-        cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION"
+        log "haiku" "WARNING: ${_count} consecutive failures on this span -- dropping it unsummarized and advancing position -> $POSITION (see thresholds.max_summary_failures)"
+        cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION" "$ENVELOPE"
         rm -f "$FAILURE_MARKER"
     else
         echo "$_key $_count" > "$FAILURE_MARKER"
-        log "haiku" "failure ${_count}/${MAX_FAILURES} on this span — will retry next run"
+        log "haiku" "failure ${_count}/${MAX_FAILURES} on this span -- will retry next run"
     fi
 }
 
@@ -465,8 +546,8 @@ if [ "$IS_SKIP" != "true" ]; then
         # does, or this span would be re-summarized on every run forever.
         log "validate" "REJECTED (not an entry header): $(echo "$FIRST_LINE" | head -c 80)"
         keep_rejected_text "$HAIKU_TEXT_FILE" "validate"
-        cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION"
-        log "validate" "position → $POSITION"
+        cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION" "$ENVELOPE"
+        log "validate" "position -> $POSITION"
         rm -f "$FAILURE_MARKER"
         exit 0
     else
@@ -511,11 +592,16 @@ if [ "$IS_SKIP" = "true" ]; then
     # stops growing, and max_summary_failures never notices because that counts
     # hard errors and this call succeeded.
     if [ "${IS_REJECTED:-false}" = "true" ]; then
-        log "haiku" "REJECTED (not a summary — refusal or clarification): $(head -c 80 "$HAIKU_TEXT_FILE" 2>/dev/null)"
+        log "haiku" "REJECTED (provider: ${PROVIDER:-claude}; not a summary -- refusal or clarification): $(head -c 80 "$HAIKU_TEXT_FILE" 2>/dev/null)"
         keep_rejected_text "$HAIKU_TEXT_FILE" "haiku"
     fi
-    log "haiku" "SKIP — position → $POSITION"
-    cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION"
+    # provider is logged here (#461): a plain "SKIP" is ambiguous about which
+    # route declined once more than one summarizer exists (#460) -- a bare
+    # host guess from the branch name or the log's surrounding lines would be
+    # reconstruction, the exact failure mode #443's envelope field exists to
+    # avoid. This is the value the call itself reported using.
+    log "haiku" "SKIP (provider: ${PROVIDER:-claude}) -- position -> $POSITION"
+    cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION" "$ENVELOPE"
     # A SKIP is a successful summarization (the model judged the span not worth
     # recording) and it advances the position, so it must clear the failure
     # count too — otherwise a stale count survives and a later single failure
@@ -576,12 +662,12 @@ fi
 # different glob (now.md.ndc-*).
 append_failed() {
     rm -f "$APPEND_TMP" 2>/dev/null
-    log "write" "ERROR: cannot write now.md — $1"
+    log "write" "ERROR: cannot write now.md -- $1"
     exit 1
 }
 rm -f "${MEMORY_FILE}".append-* 2>/dev/null
 APPEND_TMP=$(mktemp "${MEMORY_FILE}.append-XXXXXX") || {
-    log "write" "ERROR: cannot write now.md — no temp could be created beside it"
+    log "write" "ERROR: cannot write now.md -- no temp could be created beside it"
     exit 1
 }
 # `2>&1 >file` — stderr to the capture, THEN stdout to the file, in that order.
@@ -600,9 +686,9 @@ APPEND_ERR=$({ printf '\n' && cat "$HAIKU_TEXT_FILE"; } 2>&1 >> "$APPEND_TMP") \
 # here keeps the position, so the span is summarized again next run.
 APPEND_ERR=$(mv "$APPEND_TMP" "$MEMORY_FILE" 2>&1) \
     || append_failed "commit failed: ${APPEND_ERR:-unknown error}"
-log "write" "appended: $(head -1 "$HAIKU_TEXT_FILE" | cut -c1-80)"
-cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION"
-log "write" "position → $POSITION"
+log "write" "appended (provider: ${PROVIDER:-claude}): $(head -1 "$HAIKU_TEXT_FILE" | cut -c1-80)"
+cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell save-position "$LAST_SAVE_FILE" "$SESSION_ID" "$POSITION" "$ENVELOPE"
+log "write" "position -> $POSITION"
 rm -f "$FAILURE_MARKER"
 
 # --- Dispatch: after_save ---
@@ -641,7 +727,7 @@ if [ "$RUN_NDC" = true ] && [ -f "$NDC_MARKER" ]; then
         # ahead of now sets RUN_NDC=false and thereby skips the only line that
         # would have healed it: now.md is never compressed again and grows
         # without bound, which is the one file every later read walks.
-        report_error "ndc" "WARNING: $NDC_MARKER is $(( 0 - NDC_ELAPSED ))s ahead of now — the clock moved back, or the marker is corrupt in a way a digits-only check cannot see. Resetting it and compressing; the cooldown resumes from now."
+        report_error "ndc" "WARNING: $NDC_MARKER is $(( 0 - NDC_ELAPSED ))s ahead of now -- the clock moved back, or the marker is corrupt in a way a digits-only check cannot see. Resetting it and compressing; the cooldown resumes from now."
         date +%s > "$NDC_MARKER" 2>/dev/null || true
     elif [ "$NDC_ELAPSED" -lt "$NDC_COOLDOWN" ]; then
         RUN_NDC=false
@@ -662,7 +748,7 @@ esac
 TODAY_FILE="${REMEMBER_DIR}/today-${NDC_DAY}.md"
 
 if [ "$RUN_NDC" = true ]; then
-    log "ndc" "now.md → today-${NDC_DAY}.md"
+    log "ndc" "now.md -> today-${NDC_DAY}.md"
     date +%s > "$NDC_MARKER"
     NDC_SRC_BYTES=$(wc -c < "$MEMORY_FILE" | tr -d ' ')
     NDC_PROMPT=$(mktemp "${TMPDIR:-/tmp}"/remember-ndc-XXXXXX)
@@ -670,7 +756,7 @@ if [ "$RUN_NDC" = true ]; then
     cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell build-ndc-prompt "$MEMORY_FILE" "$NDC_PROMPT"
 
     if [ -s "$NDC_PROMPT" ]; then
-        (set +e  # don't inherit set -e — a haiku non-zero exit must not kill the subshell
+        (set +e  # don't inherit set -e -- a haiku non-zero exit must not kill the subshell
             NDC_ERR=$(mktemp "${TMPDIR:-/tmp}"/remember-ndc-err-XXXXXX)
             # 180s (not the 120s default): NDC compresses a whole now.md.
             NDC_VARS=$(cd "$PIPELINE_DIR" && $PYTHON -m pipeline.shell call-haiku "$NDC_PROMPT" "" 180 2>"$NDC_ERR")
@@ -694,6 +780,7 @@ if [ "$RUN_NDC" = true ]; then
                 # failure mode that writes into permanent memory.
                 IS_SKIP=false
                 IS_REJECTED=false
+                PROVIDER=claude
                 safe_eval <<< "$NDC_VARS"
                 NDC_TEXT=$(cat "$HAIKU_TEXT_FILE")
                 # Before the branch, not inside the success arm: the call has
@@ -711,7 +798,7 @@ if [ "$RUN_NDC" = true ]; then
                 # corrupted memory, written into the permanent record with no
                 # log line. now.md is left intact so the next round retries.
                 if [ "$IS_SKIP" = "true" ] || [ "${IS_REJECTED:-false}" = "true" ]; then
-                    log "ndc" "REJECTED (not a summary — refusal or clarification): $(head -c 80 "$HAIKU_TEXT_FILE" 2>/dev/null)"
+                    log "ndc" "REJECTED (provider: ${PROVIDER:-claude}; not a summary -- refusal or clarification): $(head -c 80 "$HAIKU_TEXT_FILE" 2>/dev/null)"
                     keep_rejected_text "$HAIKU_TEXT_FILE" "ndc"
                 elif [ -n "$NDC_TEXT" ]; then
                     # Under staging.lock, not save.lock and not nothing (#225).
@@ -734,7 +821,7 @@ if [ "$RUN_NDC" = true ]; then
                     # and today-*.md never sees the duplicate at all.
                     if ! staging_lock_acquire "$STAGING_LOCK_TIMEOUT"; then
                         NDC_STAGED=false
-                        log "ndc" "SKIPPED: staging.lock held for the whole ${STAGING_LOCK_TIMEOUT}s wait (a consolidation is retiring staging files) — today-${NDC_DAY}.md not appended and now.md left untouched, so the next round re-summarizes this span with no duplicate"
+                        log "ndc" "SKIPPED: staging.lock held for the whole ${STAGING_LOCK_TIMEOUT}s wait (a consolidation is retiring staging files) -- today-${NDC_DAY}.md not appended and now.md left untouched, so the next round re-summarizes this span with no duplicate"
                     else
                         NDC_STAGED=true
                         staging_append "$TODAY_FILE" "$HAIKU_TEXT_FILE"
@@ -786,7 +873,7 @@ if [ "$RUN_NDC" = true ]; then
                             (''|*[!0-9]*) NDC_LIVE_BYTES=0 ;;
                         esac
                         if [ "$NDC_LIVE_BYTES" -lt "$NDC_SRC_BYTES" ]; then
-                            log "ndc" "SKIPPED commit: now.md is ${NDC_LIVE_BYTES}b, below the ${NDC_SRC_BYTES}b snapshot this offset was taken from — left untouched (today-${NDC_DAY}.md may now hold a duplicate of this span)"
+                            log "ndc" "SKIPPED commit: now.md is ${NDC_LIVE_BYTES}b, below the ${NDC_SRC_BYTES}b snapshot this offset was taken from -- left untouched (today-${NDC_DAY}.md may now hold a duplicate of this span)"
                         else
                             # Beside now.md, not in $TMPDIR (#242). #142's whole
                             # argument for why this commit is safe is "mv-over is
@@ -914,10 +1001,10 @@ if [ "$RUN_NDC" = true ]; then
                         # nothing past this point touches now.md.
                         lock_release "$LOCK_DIR" || true
                     elif [ "$NDC_STAGED" = true ]; then
-                        log "ndc" "SKIPPED commit: another save held the lock for the whole ${NDC_COMMIT_LOCK_TIMEOUT}s wait, now.md left untouched (today-${NDC_DAY}.md now holds a duplicate of this span — the routine outcome of losing this race, not an error)"
+                        log "ndc" "SKIPPED commit: another save held the lock for the whole ${NDC_COMMIT_LOCK_TIMEOUT}s wait, now.md left untouched (today-${NDC_DAY}.md now holds a duplicate of this span -- the routine outcome of losing this race, not an error)"
                     fi
                     NDC_OUT_BYTES=$(wc -c < "$HAIKU_TEXT_FILE" | tr -d ' ')
-                    [ "$NDC_SRC_BYTES" -gt 0 ] && log "ndc" "${NDC_SRC_BYTES}→${NDC_OUT_BYTES}b (-$(( (NDC_SRC_BYTES - NDC_OUT_BYTES) * 100 / NDC_SRC_BYTES ))%)"
+                    [ "$NDC_SRC_BYTES" -gt 0 ] && log "ndc" "${NDC_SRC_BYTES}->${NDC_OUT_BYTES}b (-$(( (NDC_SRC_BYTES - NDC_OUT_BYTES) * 100 / NDC_SRC_BYTES ))%)"
                 else
                     log "ndc" "ERROR: produced empty result"
                 fi
