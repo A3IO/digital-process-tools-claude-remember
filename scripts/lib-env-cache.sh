@@ -22,7 +22,13 @@
 #
 #   Every check below is a bash builtin — `[ -f ]`, `[ -O ]`, `[ -nt ]`,
 #   parameter expansion, `read`. A validation step that forked would spend the
-#   savings it exists to protect.
+#   savings it exists to protect. The one exception (#504) is
+#   `_remember_env_cache_normalize_into`'s Windows drive-letter uppercasing,
+#   which forks `tr` -- but only on `OSTYPE=msys|cygwin`, and only once a
+#   drive-letter pattern has actually matched, the same carve-out
+#   resolve-paths.sh's own copy of this logic already makes. Everywhere else,
+#   including that same function's own substitution site, `printf -v` is used
+#   specifically so the key computation itself never forks a subshell.
 #
 # USAGE
 #   source "$_HOOK_DIR/lib-env-cache.sh"
@@ -73,17 +79,59 @@ _REMEMBER_LIB_ENV_CACHE_LOADED=1
 # resolve-paths.sh:270 still exports the RESOLVED CLAUDE_PROJECT_DIR before
 # _remember_env_cache_publish runs, so a cache file is written every time and
 # never found by _remember_env_cache_load, which runs in a fresh process
-# before that export exists. Neither value is normalised here (this can run
-# before resolve-paths.sh's Windows drive-letter normalisation, which forks
-# `tr` on Git Bash) -- the per-process pin inside the function below is what
-# keeps the key stable across a call that runs before normalisation and one
-# that runs after: without it, a call after resolve-paths.sh has normalised
-# and exported CLAUDE_PROJECT_DIR would compute a DIFFERENT key than an
-# earlier call in the same process saw, on a platform where normalisation
-# changes the string (a no-op on macOS/Linux, where raw and resolved always
-# agree -- #79 already excludes Windows from the bash-subprocess test suite
-# that exercises most of this file, which is why this needed its own
-# reasoning rather than a test run here).
+# before that export exists. The per-process pin inside the function below is
+# what keeps the key stable across a call that runs before resolve-paths.sh's
+# normalisation and one that runs after, WITHIN one process -- but #504 found
+# that pin is not enough on its own: user-prompt-hook.sh's fast path calls
+# this BEFORE resolve-paths.sh has run, in a FRESH process, so it pins the RAW
+# CLAUDE_PROJECT_DIR the host set (unnormalised on Windows/Git-Bash --
+# forward-slash or POSIX drive form); session-start-hook.sh's publish call
+# runs AFTER resolve-paths.sh, in ITS OWN process, and pins the NORMALISED
+# form resolve-paths.sh re-exported. Two different processes, two different
+# strings for the same project, two different cache files -- the fast path
+# can never hit what the slow path wrote. _remember_env_cache_normalize_into
+# below closes that: same normalisation resolve-paths.sh's own
+# _remember_normalize_win_path applies, scoped to the same `case "$OSTYPE" in
+# msys|cygwin)` guard, so its BODY is a genuine no-op (no `tr` fork, no
+# regex work) on every platform except the one where raw and resolved can
+# actually disagree. Written into a named variable via `printf -v`, not
+# printed for a caller to capture with `$( )` -- self-review on this same
+# change (#511/#504, reviewed together) caught that `$(...)` forks a
+# subshell for the SUBSTITUTION ITSELF regardless of what the function body
+# does, which would have paid exactly the per-fork cost #511 exists to
+# remove, on the fast path, on every single invocation, unconditionally on
+# every platform -- not scoped to msys/cygwin the way the function body is.
+# `_remember_normalize_win_path` in resolve-paths.sh keeps the older
+# print-and-capture shape because that file's own callers are cold-path
+# (once per hook invocation, after resolve-paths.sh has already forked far
+# more than this); lib-env-cache.sh's copy exists specifically because this
+# one runs on the hot path, so it gets the `_into` treatment from the start.
+_remember_env_cache_normalize_into() {
+    local _var="$1" _in="$2" _drive="" _rest=""
+    local _re='^([a-zA-Z]):[/\](.*)$'
+    case "$OSTYPE" in
+        msys|cygwin)
+            if [[ "$_in" =~ ^/cygdrive/([a-zA-Z])/(.*)$ ]]; then
+                _drive="${BASH_REMATCH[1]}"
+                _rest="${BASH_REMATCH[2]}"
+            elif [[ "$_in" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+                _drive="${BASH_REMATCH[1]}"
+                _rest="${BASH_REMATCH[2]}"
+            elif [[ "$_in" =~ $_re ]]; then
+                _drive="${BASH_REMATCH[1]}"
+                _rest="${BASH_REMATCH[2]}"
+            fi
+            if [ -n "$_drive" ]; then
+                _drive=$(printf '%s' "$_drive" | tr '[:lower:]' '[:upper:]')
+                _rest="${_rest//\//\\}"
+                printf -v "$_var" '%s:\\%s' "$_drive" "$_rest"
+                return 0
+            fi
+            ;;
+    esac
+    printf -v "$_var" '%s' "$_in"
+}
+
 _remember_env_cache_path() {
     # Pinned once per process (#469): this function runs both BEFORE
     # resolve-paths.sh (from _remember_env_cache_load, when CLAUDE_PROJECT_DIR
@@ -104,6 +152,16 @@ _remember_env_cache_path() {
     fi
     local _key="${CLAUDE_PROJECT_DIR:-${REMEMBER_HOOK_CWD:-}}"
     [ -n "$_key" ] || return 1
+    # #504: normalise BEFORE pinning, so a raw (pre-resolve-paths.sh) and an
+    # already-normalised (post-resolve-paths.sh) spelling of the same project
+    # collapse to the same key. Idempotent on an already-normalised string --
+    # the drive-letter regex matches a backslash-separated input just as
+    # readily as a forward-slash one, and re-uppercasing an already-uppercase
+    # drive letter is a no-op. `_into` (writes `_key` directly via
+    # `printf -v`), not `_key=$(_remember_env_cache_normalize "$_key")` --
+    # see the comment above the function for why that distinction matters
+    # here specifically.
+    _remember_env_cache_normalize_into _key "$_key"
     _REMEMBER_ENV_CACHE_KEY="$_key"
     _key="${_key//[!a-zA-Z0-9]/-}"
     # Filename length limits are real (255 bytes on most filesystems) and a deep
