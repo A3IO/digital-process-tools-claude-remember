@@ -108,6 +108,10 @@ fi
 # same reason that file gives for keeping its own copy: a hook that has to
 # survive a broken install is better served by a few duplicated lines than a
 # shared library it might fail to source.
+#
+# #494: whether a real host payload can nest a `cwd` key AHEAD of this
+# field is researched in scripts/user-prompt-hook.sh, next to its own
+# `_stdin_cwd` -- same extractor mechanism, same finding, not repeated here.
 _stdin_json_string() {
     local key="$1" raw="$2" rest prefix value
     case "$raw" in *"\"$key\""*) ;; *) return 1 ;; esac
@@ -262,6 +266,35 @@ fi
 # them apart.
 mkdir -p "$REMEMBER_DIR/logs/autonomous" 2>/dev/null
 _END_LOG="$REMEMBER_DIR/logs/autonomous/session-end-$(_remember_date +%H%M%S).log"
+# Seeded with a header line BEFORE the subshell below ever opens it, and the
+# subshell appends (`>>`) rather than truncates (`>`) -- not cosmetic (#483).
+# save-session.sh's own NDC step sweeps this very directory for stale logs
+# with `find ... -name "*.log" -empty -delete` (scripts/save-session.sh), and
+# on an ordinary successful flush NOTHING ever writes to this file: every
+# save-session.sh log line goes to its own daily narrative file, not to
+# stdout/stderr, so a `>`-truncated, still-empty $_END_LOG is exactly what
+# that same sweep -- run from INSIDE the process writing into it -- matches
+# and deletes. Two costs followed: the WARNING below named a path that was
+# already gone by the time anyone read it, and a healthy flush left nothing
+# on disk to confirm it ran at all. A non-empty file at open time is never
+# `-empty`, so it survives its own run's housekeeping while a genuinely
+# stale, still-empty log from an abandoned run is untouched by this and
+# keeps getting swept exactly as before.
+# `>>`, not `>` -- this is a synchronous, foreground write into a path a
+# CONCURRENT SessionEnd hook for the same project can compute identically
+# ($_END_LOG has second granularity only, no PID/session-id, and two Claude
+# Code windows on one project ending inside the same wall-clock second is a
+# case scripts/doctor.sh's own SessionEnd-liveness comments already treat as
+# ordinary). A truncating `>` here would clobber whatever a sibling
+# session's already-backgrounded subshell had appended by that instant --
+# not the #483 empty-file bug, a new one this line would otherwise
+# introduce. `>>` creates the file exactly as well as `>` does when it does
+# not yet exist, so nothing about the #483 fix (surviving `-empty -delete`)
+# changes; it only stops adding a fresh way to lose a sibling's output.
+# `_END_LOG`'s own collision risk (no PID/session-id in the filename) is
+# pre-existing and unresolved by this line -- see #483's pull request for
+# the follow-up filed against it.
+printf '%s [session-end] flush started\n' "$(_remember_date +%H:%M:%S)" >> "$_END_LOG" 2>/dev/null
 (
     if [ -n "$STDIN_SESSION_ID" ]; then
         bash "$SAVE_SCRIPT" "$STDIN_SESSION_ID" --force
@@ -272,7 +305,7 @@ _END_LOG="$REMEMBER_DIR/logs/autonomous/session-end-$(_remember_date +%H%M%S).lo
     if [ "$_flush_status" -ne 0 ]; then
         report_error "session-end" "WARNING: save-session.sh --force exited $_flush_status at session end -- this session's unsaved tail may be lost. See $_END_LOG for what save-session.sh itself logged."
     fi
-) < /dev/null > "$_END_LOG" 2>&1 &
+) < /dev/null >> "$_END_LOG" 2>&1 &
 echo $! > "$REMEMBER_DIR/tmp/save-session.pid" 2>/dev/null
 disown 2>/dev/null || true
 

@@ -6,13 +6,23 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![OS](https://img.shields.io/badge/tested%20on-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/Digital-Process-Tools/claude-remember/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-Community-brightgreen)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.24.0-orange)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.25.0-orange)](.claude-plugin/plugin.json)
 
 Claude Code starts every session blank. It doesn't know what you worked on yesterday, what conventions your team follows, or what mistakes it already made. You re-explain everything, every time.
 
 Claude Remember fixes that. It hooks into Claude Code's lifecycle — saving sessions automatically, compressing them through Haiku into layered daily summaries, and loading them back into context on the next session start. No manual prompting, no copy-pasting notes. The agent starts every session with its history already present.
 
 The result: your Claude Code instance develops continuity. It remembers what it learned, what broke, what worked. Not perfect recall — compressed, practical memory that fits in minimal tokens.
+
+## From the same workshop
+
+Four plugins, one team, each does one thing. This one and three siblings:
+
+- [claude-jit-context](https://github.com/Digital-Process-Tools/claude-jit-context): project knowledge that loads only when the prompt, the file or the tool matches it.
+- [claude-supertool](https://github.com/Digital-Process-Tools/claude-supertool): batched file and tracker ops. One call instead of seven, and a refusal instead of a wrong answer.
+- [claude-oss](https://github.com/Digital-Process-Tools/claude-oss): the maintainer loop that runs these four repos. Triage, build, review, merge, release.
+
+All four install from one marketplace: `/plugin marketplace add Digital-Process-Tools/claude-marketplace`.
 
 ## Install
 
@@ -69,9 +79,11 @@ The Codex-side manifest is a *second* file, `hooks/hooks.codex.json`, rather tha
 
 **Per-turn capture failed outright before [#444](https://github.com/Digital-Process-Tools/claude-remember/issues/444)** -- `scripts/user-prompt-hook.sh` and `scripts/post-tool-hook.sh` had no way to resolve `PROJECT_DIR` on a host that never sets `CLAUDE_PROJECT_DIR`, and `|| exit 0`'d silently. Fixed by giving both hooks the same stdin-`cwd` fallback `#411` already gave `session-start-hook.sh`/`session-end-hook.sh`.
 
+**Codex's `UserPromptSubmit` stdout contract is not the same as Claude Code's, and until [#451](https://github.com/Digital-Process-Tools/claude-remember/issues/451)/[#452](https://github.com/Digital-Process-Tools/claude-remember/issues/452) that mismatch marked every prompt on Codex `Failed` regardless of exit code.** Claude Code treats this hook's plain stdout as `additionalContext`, byte for byte -- the two hosts diverge on the way *out*, not the way in. Codex's own hook engine sniffs the first non-whitespace byte of a `UserPromptSubmit` handler's stdout: `{` or `[` means "this claims to be my JSON contract" (`codex-rs/hooks/src/engine/output_parser.rs::looks_like_json`), and a byte that opens with one of those but fails to parse against Codex's own `user-prompt-submit.command.output.schema.json` marks the whole run `HookRunStatus::Failed` -- not because the hook errored, but because Codex tried to read plain text as its own wire format. `scripts/user-prompt-hook.sh` prints `[HH:MM TZ -- user]`, a stamp that opens with `[`, so every prompt on Codex read as failed once #444 made the hook print anything on that host at all. The hook now branches on whether `CLAUDE_PROJECT_DIR` is set -- Claude Code always sets it, Codex and Gemini CLI never do -- and wraps the stamp in the JSON envelope Codex's own schema names on any host where it is unset, leaving what Claude Code sees unchanged. `scripts/session-start-hook.sh` was checked against three store shapes (a full store, a repeated-handoff delivery, an empty store) and does **not** have the same defect -- but the correct claim is about the *first byte of stdout*, matching Codex's own sniffing behaviour, not "every line": the script has exactly one line that opens with `[` (`"[already delivered ... ]"`, printed once the handoff has already been shown), and it is always preceded on the same run by an unconditional `echo "=== LAST HANDOFF ==="`, so the first stdout byte in all three exercised shapes is `=` or a letter, never `{`/`[` (`tests/test_codex_upsubmit_stdout_451.py::test_session_start_first_byte_is_never_bracket_or_brace`). OBSERVED for those three shapes, not proven for every branch of a 1400-line script. Gemini CLI's own stdout contract has not been observed at all -- the JSON envelope is REASONED to be safe there too, from Codex's published schema and from Gemini CLI documenting no hook environment variables, not verified against a live Gemini install.
+
 **`PostToolUse` does fire, and does carry a usable payload -- but the per-tool-call save it triggers was itself silently rejected until [#468](https://github.com/Digital-Process-Tools/claude-remember/issues/468).** `post-tool-hook.sh` derived the session id it hands `save-session.sh` from the resolved transcript's own basename, which is the session id verbatim on Claude Code but not on Codex (`rollout-<date>-<uuid>.jsonl`) -- so every incremental save on Codex forked `save-session.sh` with an id its own `[a-f0-9-]+` validation gate was always going to reject, into an autonomous log nobody reads. `SessionEnd` was unaffected (it passes the stdin session id directly), which is why a Codex session still looked fully captured end to end: only the *incremental* saves between tool calls were silently lost, and any end that is not a clean `SessionEnd` -- a crash, a kill -- loses the whole session. The hook now prefers the session id it was actually invoked with, falling back to the basename only when nothing usable arrived on stdin, the same precedence `#407` already gave the transcript path.
 
-**Still open:** whether `codex resume` behaves correctly once extraction returns a non-zero count. Summarization still shells `claude -p`, so even correct extraction leaves the Codex-native execution path from [#406](https://github.com/Digital-Process-Tools/claude-remember/issues/406) open.
+**Not yet known, rebuilt from what is actually still unknown today (not from what was unknown when this section was first written):** whether `codex resume` behaves correctly once extraction returns a non-zero count; and whether any of the above holds on Gemini CLI at all -- everything in this section is OBSERVED against `codex-cli 0.150.1` specifically, and the `CLAUDE_PROJECT_DIR`-unset branch it shares with Gemini CLI (the stdout envelope, the `REMEMBER_HOOK_CWD` fallback) is REASONED for that third host, never verified against a live Gemini install. Summarization still shells `claude -p` regardless of host, so even correct extraction and a correct `resume` leave the Codex-native execution path from [#406](https://github.com/Digital-Process-Tools/claude-remember/issues/406) open.
 
 ### Check your version
 
@@ -194,6 +206,8 @@ All hooks and pipeline scripts are bash, so Windows users need a POSIX environme
 
 Make sure `bash`, `jq`, and `python3` are resolvable from the shell Claude Code launches hooks in.
 
+**If `UserPromptSubmit` still feels slow on a warmed project** ([#511](https://github.com/Digital-Process-Tools/claude-remember/issues/511)): each `bash` command substitution — `$( ... )` — forks a subshell, which is cheap on Linux/macOS and measurably slower on Windows Git Bash, independent of whether anything inside it shells out to an external process at all. `user-prompt-hook.sh`'s warm path forks fewer of these than it used to (the `cwd` extraction and the clock read now write into a variable directly instead of being captured through one), but one remains structurally: the block that builds the line it prints has to be captured whole so it can be folded into one JSON reply on hosts/notices that need that shape. Setting `prompt_stamp: "stable"` in `config.json` (see the table below) removes the clock read entirely and prints only `[username]`, which is the cheapest and most stable option if the per-prompt line is not something you read closely. This is **reasoned, not measured** — nobody on this project has a Windows box to time it on.
+
 ## Setup
 
 1. Copy `.claude/remember/` into your project's `.claude/` directory
@@ -279,7 +293,7 @@ Two of these events deliver their listeners' **stdout to the model**: `after_use
 
 Nothing here bounds what a hook can *do* — it runs as you, with your environment. What it bounds is what a hook can *appear to be* once its output reaches the model.
 
-`UserPromptSubmit` and `PostToolUse` are the exceptions, and deliberately so: they run on every prompt and every *tool call* respectively, **and the agent waits for both**. Rather than re-derive their inputs through the full chain (`git rev-parse`, a slug, a three-layer config merge — 19 processes, and 27 on Windows/ARM64 under QEMU, where it cost a p50 of 8.7s per prompt), they replay the resolution a previous hook already published, via `lib-env-cache.sh`. The cache is refused unless it is newer than every `config.json` layer and was written for the same project, plugin root and `HOME`, so editing config still takes effect on the next prompt. **The cache key falls back to `REMEMBER_HOOK_CWD` when `CLAUDE_PROJECT_DIR` is unset** ([#469](https://github.com/Digital-Process-Tools/claude-remember/issues/469)) — Codex and Gemini CLI never set the latter, and without the fallback the fast path was permanently dead on both: a resolution was still published on every slow-path run, keyed on a variable that would never again be set when the next invocation went looking for it, so the cache was written every time and hit never. Both fall back to the full chain whenever it declines — including when you install a listener for the event they dispatch, which needs `dispatch()`. Set `REMEMBER_ENV_CACHE=0` to turn it off ([#227](https://github.com/Digital-Process-Tools/claude-remember/issues/227), [#350](https://github.com/Digital-Process-Tools/claude-remember/issues/350)).
+`UserPromptSubmit` and `PostToolUse` are the exceptions, and deliberately so: they run on every prompt and every *tool call* respectively, **and the agent waits for both**. Rather than re-derive their inputs through the full chain (`git rev-parse`, a slug, a three-layer config merge — 19 processes, and 27 on Windows/ARM64 under QEMU, where it cost a p50 of 8.7s per prompt), they replay the resolution a previous hook already published, via `lib-env-cache.sh`. The cache is refused unless it is newer than every `config.json` layer and was written for the same project, plugin root and `HOME`, so editing config still takes effect on the next prompt. **The cache key falls back to `REMEMBER_HOOK_CWD` when `CLAUDE_PROJECT_DIR` is unset** ([#469](https://github.com/Digital-Process-Tools/claude-remember/issues/469)) — Codex and Gemini CLI never set the latter, and without the fallback the fast path was permanently dead on both: a resolution was still published on every slow-path run, keyed on a variable that would never again be set when the next invocation went looking for it, so the cache was written every time and hit never. That fallback was itself inert in `user-prompt-hook.sh` until [#479](https://github.com/Digital-Process-Tools/claude-remember/issues/479): unlike `post-tool-hook.sh`, which already read `REMEMBER_HOOK_CWD` from stdin ahead of its own cache lookup, `user-prompt-hook.sh` set it from stdin only inside the "cache missed" branch -- only after the lookup that variable was meant to key had already failed for want of it. `user-prompt-hook.sh`'s stdin read now runs unconditionally too, ahead of the cache lookup, matching `post-tool-hook.sh`'s ordering. Both fall back to the full chain whenever it declines — including when you install a listener for the event they dispatch, which needs `dispatch()`. Set `REMEMBER_ENV_CACHE=0` to turn it off ([#227](https://github.com/Digital-Process-Tools/claude-remember/issues/227), [#350](https://github.com/Digital-Process-Tools/claude-remember/issues/350)). The cache key itself is now normalized the same way `resolve-paths.sh` normalizes a Windows-native project path, before it is ever pinned ([#504](https://github.com/Digital-Process-Tools/claude-remember/issues/504)): without that, `user-prompt-hook.sh`'s fast-path lookup (which runs before `resolve-paths.sh` has normalized anything) and `session-start-hook.sh`'s publish (which runs after) could key the same project under two different spellings on a Windows drive-letter path, so the fast path would never hit what the slow path wrote.
 
 `PostToolUse` registers with no matcher, so it is the hottest hook in the plugin — tool calls outnumber prompts roughly ten to one. On macOS/bash 3.2 a warm tool call costs 6 external spawns instead of 14 (130 ms instead of 336 ms); the reporter who filed [#350](https://github.com/Digital-Process-Tools/claude-remember/issues/350) measured 750-1000 ms per tool call on Windows 11 / Git Bash before the change. The merged config file itself is still never cached — it can carry a live OAuth token and is `0600`, freshly named every invocation, for that reason — only the two numbers this hook reads out of it. The **first** tool call of a session, and the first after any config edit, still takes the whole chain and publishes it.
 
@@ -544,7 +558,8 @@ A few runtime overrides aren't in `config.json` because they're per-shell rather
 
 | Env var            | Effect                                                                                                                                                                                                                                                                                                                                                                                |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REMEMBER_BRANCH`  | Overrides the `\| <branch>` identity field in each `## HH:MM \| <branch>` memory header. Useful when Claude Code runs from a non-git directory (`$HOME`, a scratch dir) — without it the header falls back to the literal string `unknown`, which collapses the identity slot for every entry. Set to a meaningful tag (e.g. `laptop`, `cloud`, `staging`, an instance name) in your shell rc. |
+| `REMEMBER_BRANCH`  | Overrides the `\| <branch>` identity field in each `## HH:MM \| <branch>` memory header. Useful when Claude Code runs from a non-git directory (`$HOME`, a scratch dir) — without it the header falls back to the literal string `unknown`, which collapses the identity slot for every entry. Set to a meaningful tag (e.g. `laptop`, `cloud`, `staging`, an instance name) in your shell rc. It is process environment, read once at save time — one value per launched session, so it cannot distinguish several concurrent sessions of the *same* project from each other; see `REMEMBER_BRANCH_CMD` below for that case. |
+| `REMEMBER_BRANCH_CMD` | Path to an executable, invoked as `$REMEMBER_BRANCH_CMD "$SESSION_ID"`, whose stdout becomes the identity slot. Checked after `REMEMBER_BRANCH` and before the `git branch --show-current` fallback; a non-zero exit or empty stdout falls through to that fallback and logs a WARNING naming the configured command and the session — a resolver that is merely unconfigured stays silent, one that is configured and failing does not. This is the answer for [#481](https://github.com/Digital-Process-Tools/claude-remember/issues/481): several Claude Code sessions running at once in one project all share `$PROJECT_DIR`, so the git-branch fallback (and a `REMEMBER_BRANCH` set once at launch) resolve to the same value for every one of them — `$SESSION_ID` is the value already in scope that differs per session. What a session id should map to is site-specific (a local registry of named sessions, `${SESSION_ID:0:8}`, ...), so this is a hook rather than a new built-in default. **save-session.sh runs under bash, including on Windows via Git Bash** — this is exec'd directly (no shell reparsing), so give it a forward-slash or PATH-resolvable path (`/c/tools/resolve-identity`, not `C:\tools\resolve-identity.exe`) the way you would for any other bash argv. |
 | `REMEMBER_DEBUG`   | `1` emits verbose hook/cooldown lines to logs; `0` silences them. Highest precedence: it beats the `debug` config option. Unset **and** `debug` unset, the defaults differ per script — `save-session.sh` verbose, the git-backup hook quiet — which this table used to paper over with a single "default `1`" (#176).                                                                                                                                                                                                                                                                                                            |
 | `REMEMBER_MODEL`   | Model used for summarization/consolidation (the `claude -p` call). Default `haiku`. Point it at a more capable tier (e.g. `sonnet`) to improve salience and compression-cap compliance — the call is backgrounded, so there's no interactive-latency cost. **`config.json` → `model` is the source of truth** (per-project); this env var overrides it. Blank falls back to the default.                                                                                              |
 | `REMEMBER_REJECT_PATTERN` | Overrides the reject-gate regex that keeps model refusals/clarifications out of the memory layer. Blank → the narrow built-in default (anchored refusal/clarification stems only); `none` → gate disabled (only the literal `SKIP` contract applies); anything else → a custom case-insensitive regex. An invalid regex falls back to the default rather than failing the run. **`config.json` → `reject_pattern` is the source of truth**; this env var overrides it.   |
@@ -822,6 +837,37 @@ looks exactly like a green run that checked everything.
 
 Read the `SKIPPED` block at the end of a run before concluding a leg is covered.
 On a Linux runner it is where you find out that the floor bash was not.
+
+### A test that dominates the suite (`#510`)
+
+`pytest` already prints `--durations` (`addopts` carries `--durations=25`);
+nothing read it before #510, so one runaway test could grow to a large share
+of every leg's wall-clock time and the only detector was a human happening to
+scroll a CI log far enough to notice. The root-level `conftest.py` closes that:
+a `pytest_terminal_summary` hook fires at the end of *every* `pytest`
+invocation -- local or any leg of the matrix, no extra flag -- and prints the
+top durations plus the slowest single test's **share of total suite time**
+(a ratio, not an absolute second count, since an absolute count says more
+about the runner than the test). The math lives in
+`scripts/report_test_durations.py`, kept separate from the hook so it is
+testable without driving a nested `pytest` session.
+
+Three states, always distinguishable in the printed text:
+
+- `measured` -- durations were collected and compared against
+  `test-durations-baseline.json` at the repo root.
+- `no-baseline` -- durations were collected but that file does not exist yet
+  (true of every run until a maintainer records one by hand). The share is
+  still printed, said out loud as `no-baseline` rather than rendered as if
+  nothing had changed.
+- `could-not-measure` -- no per-test durations could be collected, or the
+  total suite time was not a usable number. Always names the reason; never
+  prints nothing, which would read exactly like a suite with no hot test.
+
+This is a report, never a gate: it does not fail a run on wall-clock time or
+any share threshold, on purpose -- a shared CI runner's load is not in
+anybody's diff, and a check that reddens a pull request for a neighbour's
+noisy build only teaches people to re-run until green.
 
 ### Measuring the warm path (`tests/env_cache.py`)
 

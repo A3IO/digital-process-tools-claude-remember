@@ -30,6 +30,7 @@ Python 3.9 compatible.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +50,22 @@ REFRESH_AFTER = 60
 #: order of weeks -- so they are carried forward between long intervals rather than making
 #: the board wait on them.
 LATEST_REFRESH_AFTER = 3600
+
+#: A third clock (#613), beside the two above, for the one field that answers a
+#: question neither of them can afford: is the watch channel actually delivering.
+#: `channel:health` is classed `acts` and spawns `claude mcp get` once per
+#: subscription tag -- 1-3s measured in supertool's own presets/watch/channel.py
+#: -- so it cannot share the board's 60s clock, and the consumer it asks about can
+#: die at any moment, which is far too often for LATEST_REFRESH_AFTER's 3600s.
+#:
+#: 300 is a GUESS TO BE MEASURED, not a number this module asserts as correct --
+#: the issue's own words (#613). There is no history of consumer deaths on this
+#: repository to fit an interval to, so any starting value ships unmeasured; what
+#: would settle it is a wall-clock record of how long a real death goes
+#: unreported at this interval, taken the first time one actually happens. State
+#: what it cost when that reading is in hand -- do not silently promote this
+#: constant to "measured" later without adding that record.
+CHANNEL_REFRESH_AFTER = 300
 
 #: How long a refresh may hold its lock before another render is allowed to retry. A
 #: lock that outlives a killed refresher would otherwise freeze the counts forever.
@@ -144,22 +161,246 @@ def version_status(installed, latest, stale=False):
     return {"state": state, "installed": installed, "latest": latest}
 
 
+# -------------------------------------------------------------------------- channel
+
+
+#: The text after "channel: " on `channel:health`'s own first content line,
+#: mapped to this module's five-way state (#613). Both routes to that report --
+#: `channel.py` run directly and `supertool 'channel:health'` -- agree on this
+#: text; only the exit code differs, and the supertool wrapper collapses every
+#: non-zero exit to 1, so text is the only signal both routes share. Anything
+#: not a key here -- an error page for a preset that is not enabled, output this
+#: module has never seen -- is deliberately not in this table, so it falls
+#: through to `cannot_determine` in `parse_channel_report` rather than being
+#: guessed at.
+CHANNEL_STATES = {
+    "FORWARDING": "forwarding",
+    "NOT DELIVERING": "not_delivering",
+    "CANNOT DETERMINE": "cannot_determine",
+    "CONTRADICTED": "contradicted",
+    "BOUND, NOT SUBSCRIBED": "not_subscribed",
+}
+
+#: Same name supertool's own `presets/watch/naming.py` reads (`NAME_ENV`). Not
+#: imported -- this module has no third-party imports and is vendored standalone
+#: -- so the string is duplicated rather than the module.
+WATCH_NAME_ENV = "SUPERTOOL_WATCH_NAME"
+
+#: A copy of `oss_config.WATCH_NAME_UNSAFE_RE`'s substitution, not an import of
+#: it, for the same reason `_one_line` below is a copy of `doctor.py`'s own
+#: function rather than an import: this file is vendored into `.oss/statusline.py`
+#: and must run standalone. `tests/test_statusline_channel_613.py` measures this
+#: constant against `oss_config.watch_channel_name` directly so the two copies
+#: cannot drift silently -- the failure mode #570 named for the supertool rule
+#: body, one file over.
+_WATCH_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+#: A copy of `oss_config.REPO_RE`, for the same standalone-vendoring reason as
+#: the pattern above (#653). `oss_config.watch_channel_name` routes a candidate
+#: `repo` through `repo_problem` -- this pattern -- BEFORE folding it, which is
+#: what keeps a refused value like `'..'` from ever reaching the fold. The copy
+#: above used to skip straight to the fold and had no refusal in front of it at
+#: all, so `'..'` and `'../../etc'` -- both refused by `oss_config` -- still
+#: produced a channel name here. `tests/test_statusline_watch_name_refusal_653.py`
+#: is the positive control: slugs `oss_config` REJECTS, not only ones it accepts.
+#: Excludes a backslash too, as of #897 -- `tests/test_statusline_watch_name_
+#: refusal_653.py::test_repo_re_pattern_matches_oss_configs_own_pattern` pins the
+#: two patterns together so this copy cannot drift from `oss_config.REPO_RE` again.
+_REPO_RE = re.compile(r"\A[^/\\\s]+/[^/\\\s]+\Z")
+
+#: `.supertool.json`'s own filename, read but never written -- the same constant
+#: `doctor.py` carries as `WATCH_CONFIG`, duplicated rather than imported for the
+#: same standalone-vendoring reason as every other copy in this section (#754).
+WATCH_CONFIG = ".supertool.json"
+
+
+def _expected_watch_name(repo):
+    """The watch channel name THIS repository would derive from its own `repo`.
+
+    `None` for anything that is not a non-empty string that also matches the
+    same `owner/name` shape `oss_config.repo_problem` requires -- there is no
+    name to expect from a `.oss.json` that states no repo, or one that states
+    something `oss_config` would refuse, and `None` can never equal whatever
+    `SUPERTOOL_WATCH_NAME` happens to hold, which is exactly the "do not
+    attribute" outcome the issue's closing bullet asks for.
+    """
+    if not isinstance(repo, str) or not repo:
+        return None
+    if not _REPO_RE.match(repo):
+        return None
+    return _WATCH_NAME_UNSAFE_RE.sub("-", repo)
+
+
+def _declared_watch_names(root):
+    """The distinct `ops.*.watch_name` values in this repo's own `.supertool.json`
+    (#754).
+
+    A copy of doctor.py's own `_supertool_document`/`_declared_watch_names` read
+    logic, not an import of it -- this module is vendored standalone (see the
+    module docstring) and cannot depend on `doctor.py` being present beside it.
+
+    Returns `(names, problem)`. `problem` is `None` when the file was read and
+    its shape was usable -- which includes the file not being there at all,
+    because absence is a real and common answer and a broken file is not.
+    Otherwise `"unreadable"` (could not be opened, read or parsed as JSON) or
+    `"malformed"` (parsed, and is not the object shape expected). doctor.py
+    keeps those as two answers because its reader is sent to a different
+    remedy for each; this caller only needs to know whether the file could
+    answer the attribution question at all, so both fold to the SAME
+    `declaration-unreadable` channel attribution in `_channel_reading` below --
+    still its own state, and never folded into `not-attributable`, which is
+    the fold #754 was filed against.
+    """
+    path = Path(root) / WATCH_CONFIG
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set(), None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return set(), "unreadable"
+    if not isinstance(doc, dict):
+        return set(), "malformed"
+    # Absent and malformed are not the same answer, and this asymmetry is the
+    # one both review spawns on #754 caught in #754's own fix. `ops` missing
+    # entirely is a repository that declares nothing -- real, common, and not a
+    # problem. `ops` present and the wrong shape is a file somebody edited and
+    # broke, and folding that into the first renders it as `not-attributable`
+    # one caller down: identical to a channel that genuinely belongs to another
+    # project's fleet, which is precisely the fold #754 exists to end.
+    # doctor.py's own copy has split these since #216; this one had dropped the
+    # branch while its docstring above claimed parity with it.
+    if "ops" not in doc:
+        return set(), None
+    ops = doc.get("ops")
+    if not isinstance(ops, dict):
+        return set(), "malformed"
+    # The empty-string filter is doctor.py's, kept here rather than dropped: a
+    # block declaring `"watch_name": ""` declares no name, and counting it would
+    # push a file that also declares one real name to len(declared) == 2 and so
+    # to `not-attributable` -- a second, quieter way for a broken file to read
+    # as somebody else's fleet.
+    return {
+        block["watch_name"]
+        for block in ops.values()
+        if isinstance(block, dict)
+        and isinstance(block.get("watch_name"), str)
+        and block["watch_name"]
+    }, None
+
+
+def parse_channel_report(text):
+    """The state `channel:health` reported, from its own report text, or `None`.
+
+    `None` covers everything that is not one of the five recognised states --
+    most importantly the "op 'channel' is unavailable here" refusal supertool
+    prints when the `watch` preset is not enabled, which also exits 1 and would
+    otherwise be indistinguishable from a genuine `NOT DELIVERING` (#613; this
+    was reproduced live against the installed supertool while filing this fix).
+    A caller maps `None` to `cannot_determine`, never to a guess.
+    """
+    if not text:
+        return None
+    for line in str(text).splitlines():
+        # Anchored at column 0, before any stripping (#654) -- an indented
+        # line that merely LOOKS like a state line (e.g. a padded "channel  :"
+        # detail line, or remote-authored text reproducing the shape) must
+        # never outrank the genuine state line. Stripping first erased that
+        # distinction and let the first STRIPPED match win regardless of
+        # indentation, which relied on the report's own composition order
+        # rather than on this parser's own anchor.
+        if line.startswith("channel: "):
+            return CHANNEL_STATES.get(line[len("channel: "):].strip())
+    return None
+
+
+def channel_status(raw_state, attribution, fetched_at, now, interval=CHANNEL_REFRESH_AFTER):
+    """Fold a raw `channel:health` reading, its own age and its attribution into
+    the state `render` actually shows (#613, widened by #754).
+
+    Four ways this becomes `cannot_determine` before a caller ever sees one of
+    the five real states, and each is a distinct reason a reader might act on
+    differently -- collapsing them into one `?` would be this module's own
+    defect class, the same reason `board_from_cache` keeps its counts separate:
+
+    * ``not-asked``    -- nobody has taken a reading yet (`fetched_at` is None).
+    * ``stale``        -- the reading is older than its own refresh interval
+      (#550/#551's lesson, applied a third time: never let an old reading
+      render as though it were fresh).
+    * ``not-attributable`` -- the channel name this reading came from is
+      neither what this repository's own `.oss.json` would derive NOR what
+      this repository's own tracked `.supertool.json` declares, so the socket
+      and poller slots may be another project's fleet entirely. Checked first
+      and unconditionally: an unattributed reading must never reach the
+      real-state branch below, however fresh it is.
+    * ``declaration-unreadable`` -- neither route settled it, and the reason
+      the declaration route could not is that `.supertool.json` is there and
+      could not be read or parsed (#754). A file this module could not open
+      is not evidence of "somebody else's fleet" -- it is evidence the
+      question could not be asked, and folding the two together is precisely
+      this repository's own defect class landing on the fix for it.
+
+    `attribution` is one of ``"derivation"``, ``"declaration"``,
+    ``"not-attributable"`` or ``"declaration-unreadable"`` -- `_channel_reading`
+    decides which; this function only asks whether it is one of the first two
+    (real attribution) or not.
+
+    Deliberately NOT handled here, and this is #551's own gap restated for a
+    third instrument: a reading that is fresh BY THIS RULE and simply wrong --
+    the consumer died one second after the reading was taken -- renders exactly
+    like a correct one. Nothing performs "the consumer died" the way
+    `/oss:release` performs a publish, so there is no falsifying event to
+    invalidate the cache against; #613's own docstring on `CHANNEL_REFRESH_AFTER`
+    states that gap rather than papering over it.
+
+    `not-asked` is checked BEFORE attribution, and that order is deliberate: a
+    cache holding no reading at all also holds no attribution, so `attribution`
+    defaults to a not-attributed value there too -- checking it first would
+    report every never-asked repository as "not this repo's fleet" instead of
+    "nobody has looked yet", which is a different and more alarming claim about
+    a question that was never even put.
+    """
+    if not isinstance(fetched_at, (int, float)):
+        return {"state": "cannot_determine", "reason": "not-asked"}
+    if attribution == "declaration-unreadable":
+        return {"state": "cannot_determine", "reason": "declaration-unreadable"}
+    if attribution not in ("derivation", "declaration"):
+        return {"state": "cannot_determine", "reason": "not-attributable"}
+    if now - fetched_at >= interval:
+        return {"state": "cannot_determine", "reason": "stale"}
+    if raw_state not in CHANNEL_STATES.values():
+        return {"state": "cannot_determine", "reason": "unrecognized"}
+    return {"state": raw_state, "reason": None}
+
+
 # ---------------------------------------------------------------------------- board
 
 
 def board_from_cache(cache, now=None):
-    """Read the two forge counts back out of a cache document.
+    """Read the forge counts back out of a cache document.
 
     Each count is read on its own. A cache written by a refresh where one call answered
-    and the other did not is a real state, and collapsing it to "unknown board" throws
-    away the half that was measured.
+    and another did not is a real state, and collapsing it to "unknown board" throws away
+    the half that was measured -- which is why there is no summary `state` field here.
+    An earlier version computed one (`unknown`/`partial`/`measured`) from exactly these
+    same values, but nothing ever read it: `_board_field` renders `?` per missing value
+    directly off `prs`/`issues`/`issues_external`/`checks`, regardless of what a summary
+    said. #595 added a rule to that summary -- a cache carrying `issues` but no
+    `issues_external` is `partial` -- and the rule could not affect anything a maintainer
+    sees, because the field it was added to had no caller. That is the same shape as a
+    check that never runs (#597): a guard nobody reads. Deleted rather than wired to a
+    reader, because each of the three counts below already carries its own missing/present
+    distinction, and a summary that can disagree with the values it summarizes is a second
+    copy of the same fact -- one that was, in fact, never even complete: it never accounted
+    for `checks` at all.
     """
     if not isinstance(cache, dict):
-        return {"state": "unknown", "prs": None, "issues": None, "age": None}
+        return {"prs": None, "issues": None, "issues_external": None, "age": None}
     prs = cache.get("prs")
     issues = cache.get("issues")
+    issues_external = cache.get("issues_external")
     prs = prs if isinstance(prs, int) else None
     issues = issues if isinstance(issues, int) else None
+    issues_external = issues_external if isinstance(issues_external, int) else None
     checks = cache.get("pr_checks")
     if not (
         isinstance(checks, dict)
@@ -172,13 +413,10 @@ def board_from_cache(cache, now=None):
     age = None
     if isinstance(fetched, (int, float)):
         age = max(0.0, (time.time() if now is None else now) - fetched)
-    if prs is None and issues is None:
-        state = "unknown"
-    elif prs is None or issues is None:
-        state = "partial"
-    else:
-        state = "measured"
-    return {"state": state, "prs": prs, "issues": issues, "checks": checks, "age": age}
+    return {
+        "prs": prs, "issues": issues, "issues_external": issues_external,
+        "checks": checks, "age": age,
+    }
 
 
 # ------------------------------------------------------------------ release progress
@@ -571,6 +809,7 @@ def _symbols(ascii_only):
             "bad": "x",
             "run": "...",
             "unk": "?",
+            "own": "b",
         }
     return {
         "sep": " | ",
@@ -592,6 +831,13 @@ def _symbols(ascii_only):
         "bad": "✗",
         "run": "⋯",
         "unk": "?",
+        # `BOUND, NOT SUBSCRIBED` (#613): a consumer that is bound, verified and
+        # counting, with nobody subscribed -- distinct from both `ok` and `bad`,
+        # because it is neither a pass nor an absence, it is a finding of its own
+        # (supertool's own `presets/watch/channel.py` docstring: "a fourth state
+        # on purpose", "a fifth state for the same reason"). Half-filled shape
+        # reads as "handed off, half-heard" even before the colour is read.
+        "own": "◐",
     }
 
 
@@ -638,7 +884,8 @@ def _last_field(stamp):
 
 
 def _board_field(board, symbols, color=False):
-    """`4pr 2ok 1x 1... 0? . 23is` -- how many are open, and what CI says about each.
+    """`4pr 2ok 1x 1... 0? . 23is / 2eis` -- how many are open, what CI says about each,
+    and how many of the issues arrived from outside repository membership (#595).
 
     Lowercase because the fields either side of it are, and a status line that shouts one
     field trains the eye to read that one first regardless of what it says.
@@ -647,10 +894,14 @@ def _board_field(board, symbols, color=False):
     makes the reader subtract to find what is missing, and `0x` -- nothing red -- and `0...`
     -- nothing on the way -- are two of the more useful things this line can say. The one
     thing that does collapse is a reading that never happened: rollups nobody could fetch
-    render as a single `?`, never as four zeros.
+    render as a single `?`, never as four zeros. `eis` follows the same rule: `0eis` is a
+    real reading -- nobody outside has filed anything -- and it must stay visibly different
+    from `?eis`, a count nobody could take, because zero external issues is both a common
+    true answer and exactly what a failed call looks like.
     """
     prs = board.get("prs")
     issues = board.get("issues")
+    issues_external = board.get("issues_external")
     checks = board.get("checks")
     if isinstance(checks, dict):
         groups = " ".join(
@@ -664,11 +915,12 @@ def _board_field(board, symbols, color=False):
         )
     else:
         groups = symbols["unk"]
-    return "{}pr {}{}{}is".format(
+    return "{}pr {}{}{}is / {}eis".format(
         "?" if not isinstance(prs, int) else prs,
         groups,
         symbols["dot"],
         "?" if not isinstance(issues, int) else issues,
+        "?" if not isinstance(issues_external, int) else issues_external,
     )
 
 
@@ -810,6 +1062,91 @@ def _plugins_field(plugins, symbols, color=False):
     return "plug " + " ".join(parts)
 
 
+def _channel_field(channel, symbols, color=False):
+    """`ch` + a one-glyph verdict on the watch channel, or nothing at all (#613).
+
+    Three or four characters -- the same width discipline `_plugins_field` (#512)
+    argues for (that field spent 45 characters saying nothing on almost every
+    render), scaled down for a field with five possible states rather than a
+    per-plugin list.
+    `None` -- never a placeholder `?` -- when `watch_channel` is off in
+    `.oss.json`: an operator's deliberate off switch is not the same absence as
+    a question this line asked and could not answer, and the whole point of the
+    third state this repository is named after is keeping those apart.
+
+    The five upstream states map to distinct markers because they call for
+    distinct actions (the issue's own table): a pass, a definite negative, a
+    finding that is neither, a contradiction, and "nothing was established".
+    `CONTRADICTED` renders uncoloured on purpose, matching the issue's own table,
+    whose shade column is blank for that row alone.
+
+    **What this must never claim, in the render layer too, not only in the
+    docstrings that compute the state:** `forwarding` means the consumer's own
+    counters are moving, never that an event reached a Claude session --
+    `channel:health`'s own module docstring states outright that delivery into a
+    session is not observable from outside it. Nothing here spells `forwarded`
+    as `delivered`.
+    """
+    if channel is None:
+        return None
+    state = channel.get("state")
+    if state == "forwarding":
+        text, shade = "ch" + symbols["ok"], GREEN
+    elif state == "not_delivering":
+        text, shade = "ch" + symbols["bad"], RED
+    elif state == "not_subscribed":
+        text, shade = "ch" + symbols["own"], YELLOW
+    elif state == "contradicted":
+        text, shade = "ch!", None
+    else:
+        text, shade = "ch" + symbols["unk"], DIM
+    if not color or shade is None:
+        return text
+    return shade + text + RESET
+
+
+#: `gh-branch`'s own four states, folded onto `_symbols`' four render glyphs (#856).
+#: `"bad"` gets its own glyph -- a leg has actually failed, the one state that is a
+#: finding rather than "not settled yet". `"running"` and `"no-run"` share `run` on
+#: purpose: both mean "nothing to act on, look again later", and collapsing them is
+#: the deliberate call the issue asked for rather than an oversight -- see
+#: `_gh_default_branch_state`'s own docstring for why they are still told apart
+#: before they reach this table, so `"no-run"` never silently becomes `"running"`.
+_DEFAULT_BRANCH_GLYPH_KEY = {
+    "green": "ok",
+    "bad": "bad",
+    "running": "run",
+    "no-run": "run",
+}
+
+
+def _default_branch_marker(state, symbols, color=False):
+    """One glyph, glued onto the repository name, for whether the default branch's
+    head commit is green right now (#856) -- the reading nothing on this line said
+    anything about, including the moment right after this loop's own merge, when
+    the branch has a fresh commit and no concluded run yet.
+
+    `None` -- rendering nothing, never `?` -- when `state` is `None`: either the
+    config declares no default branch to compare against (a deliberate absence of
+    the question, the channel field's own convention, #613), or `gather()` has
+    already folded a stale reading into `"unknown"` before this function ever
+    sees it, in which case `state == "unknown"` reaches here and DOES render --
+    the `unk` glyph -- because a stale reading is a real answer ("we cannot
+    currently say"), not the same absence as never having asked at all.
+
+    Colour reinforces the glyph and is never its only carrier (#549/#550): every
+    state below is a distinct shape in `_symbols`, monochrome or not.
+    """
+    if state is None:
+        return None
+    key = _DEFAULT_BRANCH_GLYPH_KEY.get(state, "unk")
+    text = symbols[key]
+    if not color:
+        return text
+    shade = {"ok": GREEN, "bad": RED, "run": YELLOW}.get(key, DIM)
+    return shade + text + RESET
+
+
 def render(facts, ascii_only=False, color=False):
     """The whole line, from facts already gathered. No I/O, so it is testable.
 
@@ -831,6 +1168,14 @@ def render(facts, ascii_only=False, color=False):
 
     repo_name = facts.get("repo_name")
     repo_name = _one_line(str(repo_name)) if repo_name else "?"
+    # Glued onto the repo name with no separator, beside it rather than its own block
+    # (#856) -- the identity block is already `name branch vversion`, one glance, and
+    # this is one more glyph about the same subject rather than a fourth fact needing
+    # its own width. `None` here means nothing rendered at all: see
+    # `_default_branch_marker`'s own docstring for the two different reasons it can be.
+    branch_marker = _default_branch_marker(facts.get("default_branch_state"), symbols, color)
+    if branch_marker is not None:
+        repo_name = repo_name + branch_marker
     # The branch only when it is not the declared default (#509): in the clone that field
     # said `main` on every render, and this loop works in worktrees, so it cost width in
     # the one place it carried nothing and was identical in the place it carries news.
@@ -864,6 +1209,9 @@ def render(facts, ascii_only=False, color=False):
     blocks.append(_last_field(facts.get("last")))
 
     blocks.append(_plugins_field(facts.get("plugins") or [], symbols, color))
+    channel_block = _channel_field(facts.get("channel"), symbols, color)
+    if channel_block is not None:
+        blocks.append(channel_block)
     return symbols["sep"].join(blocks)
 
 
@@ -1099,6 +1447,90 @@ def _gh_count(repo, kind):
         return None
 
 
+#: GitHub's own membership tiers -- `authorAssociation` values that mean "one of us".
+_INSIDE_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+
+def _gh_external_issue_count(repo, total):
+    """How many of the `total` open issues (`_gh_count`'s own answer) were filed by
+    someone outside repository membership, per GitHub's `authorAssociation` (#595).
+
+    Not `-author:@me`: that resolves to whoever is authenticated on this machine, so
+    the count would be a fact about a laptop rather than about the repository, and a
+    second maintainer running this same loop would see a different number for the
+    same tracker. `authorAssociation` is repo-relative and identical for everyone --
+    and it is already what supertool's own `gh-issues` op uses for its external-filer
+    marker, so the two boards agree instead of answering differently.
+
+    **Not `gh issue list --json authorAssociation` (#620).** That field has never
+    existed on `gh issue list` -- `gh` refuses the whole call, exit 1, empty stdout,
+    every single time, and the six-fixture suite that shipped with #595 could not
+    catch it because every fixture there mocked `_run`'s *return value* and none of
+    them looked at what `_run` was *called with*. `author_association` does exist on
+    the REST `repos/{owner}/{repo}/issues` listing, so this reads that instead, with
+    `--jq` selecting the one field this function needs and dropping pull requests --
+    that endpoint mixes both, and a PR row carries a `pull_request` key an issue never
+    has, so `select(.pull_request == null)` filters server-side before this function
+    ever sees a row. Without it the row count would include PRs and permanently fail
+    the cross-check below, because `_gh_count`'s own `is:issue` search never counts
+    them.
+
+    **`--jq` output, not `--paginate`'s raw concatenation, and the difference is not
+    cosmetic.** `_gh_count`'s own docstring already documents that `gh api --paginate
+    --jq` runs its filter once per page and prints one number per page with no total
+    -- irrelevant here, since this asks for one row per issue rather than a count.
+    What matters for `--paginate` *without* `--jq` is that each page is a raw JSON
+    array, and concatenating two JSON arrays end to end produces text no parser can
+    read (`[...][...]`) -- the exact trap #620's own writeup names for a naive fix.
+    `--jq` sidesteps it by construction: piping `.[] | select(...) | .author_association`
+    through jq's raw-output mode prints one bare `author_association` value per line,
+    and *lines* concatenate safely across pages -- unlike JSON arrays, there is no
+    boundary for two pages' lines to collide on. `--paginate` alone still walks every
+    page regardless of the repository's issue count, so there is no analogue of the
+    old `--limit`-at-100 hazard to reintroduce here.
+
+    The row count is cross-checked against `total` exactly as before: fewer lines
+    than the count `_gh_count` already took means this call did not cover every open
+    issue (a rate limit, a truncated page, the tracker growing between the two
+    calls), and the number is not reliable enough to report. `None`, never a count
+    smaller than the truth -- the same convention `_gh_count`'s own docstring names.
+    A `null` line (jq's raw-mode spelling of a missing/`None` field) is treated the
+    same as a missing row: one unreadable association and the whole count is untaken.
+    """
+    if not isinstance(total, int):
+        return None
+    out = _run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "-X",
+            "GET",
+            "repos/{}/issues".format(repo),
+            "-f",
+            "state=open",
+            "-f",
+            "per_page=100",
+            "--jq",
+            ".[] | select(.pull_request == null) | .author_association",
+        ],
+        timeout=25,
+    )
+    if out is None:
+        return None
+    lines = out.split("\n") if out else []
+    if len(lines) != total:
+        return None
+    external = 0
+    for line in lines:
+        assoc = line.strip()
+        if not assoc or assoc.upper() == "NULL":
+            return None
+        if assoc.upper() not in _INSIDE_ASSOCIATIONS:
+            external += 1
+    return external
+
+
 #: How many open pull requests one rollup page carries. Anything past it is counted as
 #: unknown rather than dropped, so the groups still sum to the exact count beside them.
 ROLLUP_PAGE = 100
@@ -1134,6 +1566,193 @@ def _gh_rollups(repo):
     except ValueError:
         return None
     return rows if isinstance(rows, list) else None
+
+
+#: Concluded check-run outcomes read as a failure, for `_reading_from_check_runs`.
+#: Matches `gh-branch`'s own red/benign split exactly (supertool's
+#: `presets/_checks.py`: `FAILED_STATES` plus everything in `bucket()`'s
+#: "other" catch-all except its own `BENIGN_STATES`) -- `startup_failure` is a
+#: documented `conclusion` value (a run that failed before it could even
+#: start) and belongs beside `failure`/`timed_out`, not omitted from it; a
+#: `neutral`/`skipped`/`manual` conclusion is deliberately left out (a run
+#: explicitly opting out of pass/fail is not a failure, the same call
+#: `gh-branch`'s own `BENIGN_STATES` makes). Review found the omission of
+#: `startup_failure` on this same round (#914).
+_BAD_CHECK_RUN_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "action_required", "cancelled", "stale",
+     "startup_failure"}
+)
+
+
+def _reading_from_check_runs(repo, branch):
+    """One raw reading off the check-runs endpoint (#914): total entries, and
+    whether any of them are failed / still in flight / passed.
+
+    GitHub Actions writes check-runs, not legacy commit statuses -- on an
+    Actions-only repository the combined-status endpoint's `total_count` is `0`
+    on every commit, always, which is #914's whole defect. This is the source
+    that actually carries Actions data.
+
+    Returns ``None`` when the call did not answer or produced something this
+    function cannot parse -- never confused with a reading that genuinely came
+    back empty, which is a dict with ``total == 0`` and every flag ``False``.
+    """
+    out = _run(
+        [
+            "gh",
+            "api",
+            "-X",
+            "GET",
+            "repos/{}/commits/{}/check-runs".format(repo, branch),
+            "-f",
+            "per_page=100",
+            "--jq",
+            "{total: .total_count, "
+            "entries: [.check_runs[] | {status: .status, conclusion: .conclusion}]}",
+        ],
+        timeout=25,
+    )
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    total = data.get("total")
+    entries = data.get("entries")
+    if not isinstance(total, int) or not isinstance(entries, list):
+        return None
+    # `gh api` does not auto-paginate. `per_page=100` covers the ordinary case, but a
+    # commit with more check-runs than that still has a truncated `entries` here while
+    # `total` (read straight from `.total_count`) stays correct -- the same "counted
+    # right, read wrong" shape `_gh_external_issue_count` already guards against one
+    # function over. Read as `None` (could not look) rather than scanning a partial
+    # page and guessing "green" from entries that happen to all be `success`.
+    if len(entries) != total:
+        return None
+    bad = False
+    running = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") in ("queued", "in_progress"):
+            running = True
+            continue
+        if entry.get("conclusion") in _BAD_CHECK_RUN_CONCLUSIONS:
+            bad = True
+    # Conjunctive, matching `gh-branch`'s own `verdict()`: green is "nothing
+    # failed and nothing is still moving", not "at least one entry said
+    # success". A commit whose only check-runs are `skipped`/`neutral` is
+    # GREEN there too (review found this divergence on this same round,
+    # #914) -- a per-entry `conclusion == "success"` requirement would read
+    # that same commit as neither green nor bad nor running (it has no
+    # `"success"` entry either) and fall through to `None`, an unknown that
+    # `gh-branch` does not share.
+    green = total > 0 and not bad and not running
+    return {"total": total, "bad": bad, "running": running, "green": green}
+
+
+def _reading_from_combined_status(repo, branch):
+    """The same shape as `_reading_from_check_runs`, off the legacy
+    combined-status endpoint (`repos/{repo}/commits/{ref}/status`).
+
+    Kept alongside the check-runs reading rather than replaced by it (#914): a
+    repository could carry legacy commit statuses posted by an external CI with
+    no GitHub Actions runs at all, and this is the only source that would ever
+    see those. Neither source alone can answer `"no-run"` on its own -- see
+    `_gh_default_branch_state`, which is where the two readings are merged.
+
+    `error` is read the same as `failure`. GitHub's own docs give the COMBINED
+    summary's top-level `state` a three-value enum -- `failure`/`pending`/`success`
+    -- so this is a defensive extra rather than a documented fourth value: `error`
+    is the spelling an INDIVIDUAL entry in the legacy `statuses[]` array can carry,
+    one level below what this function's own `--jq` filter reads. Kept anyway,
+    because a top-level `state` outside its documented enum is exactly the shape
+    an undocumented API change would take, and reading it as bad -- rather than
+    falling through to `None`, which the merge below reads as "this source did
+    not answer" -- is the conservative direction to guess wrong in.
+    """
+    out = _run(
+        [
+            "gh",
+            "api",
+            "repos/{}/commits/{}/status".format(repo, branch),
+            "--jq",
+            "{state: .state, total: .total_count}",
+        ],
+        timeout=25,
+    )
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    total = data.get("total")
+    if not isinstance(total, int):
+        return None
+    state = data.get("state")
+    return {
+        "total": total,
+        "bad": state in ("failure", "error"),
+        "running": state == "pending" and total > 0,
+        "green": state == "success",
+    }
+
+
+def _gh_default_branch_state(repo, branch):
+    """Is the default branch's head commit green? One of the four states `gh-branch`
+    itself answers, read off two cheaper calls (#856, and #914 for the second one).
+
+    `gh-branch` (supertool) enumerates every workflow run on the head SHA and
+    collapses re-runs and multi-run workflows to answer conjunctively -- machinery
+    this render does not need, because it produces one glyph, not a table.
+
+    **Two sources, not one (#914).** The combined-status endpoint alone answers
+    `total_count == 0` on every commit of an Actions-only repository, because
+    GitHub Actions writes check-runs, not legacy commit statuses -- so a repo
+    whose CI is entirely Actions (this one) could never read anything but
+    `"no-run"` off it. Check-runs alone has the opposite gap: a repository
+    carrying legacy statuses from an external CI, with no Actions runs at all,
+    would show up as empty there. Neither reading is read as authoritative on
+    its own; both are taken and merged below.
+
+    Returns ``"green"``, ``"bad"``, ``"running"``, ``"no-run"``, or ``None`` when
+    the branch or repo is not configured, or the call did not answer.
+
+    **Merge order is bad, then running, then green, then no-run/None** -- the
+    same "worst wins" shape `gh-branch` itself uses across workflows. A failure
+    on either source is a failure; a leg still in flight on either source means
+    "not settled" even if the other source is quiet; `"no-run"` is reserved for
+    the case both sources answered and both came back with `total == 0`. If one
+    source did not answer at all (`None`) and the other came back empty, this is
+    read as `None` rather than guessed as `"no-run"` -- the unanswered source
+    could carry data this function never saw, and `None` is what every caller
+    here already reads as "no answer", never as "confirmed idle" (mirrors the
+    `total_count == 0` vs `state` distinction the combined-status reading always
+    made, one level up: an absence this function produced must not render as an
+    absence on the branch).
+    """
+    if not repo or not branch:
+        return None
+    check_runs = _reading_from_check_runs(repo, branch)
+    status = _reading_from_combined_status(repo, branch)
+    if check_runs is None and status is None:
+        return None
+    if (check_runs and check_runs["bad"]) or (status and status["bad"]):
+        return "bad"
+    if (check_runs and check_runs["running"]) or (status and status["running"]):
+        return "running"
+    if (check_runs and check_runs["green"]) or (status and status["green"]):
+        return "green"
+    if check_runs is not None and status is not None:
+        if check_runs["total"] == 0 and status["total"] == 0:
+            return "no-run"
+    return None
 
 
 def _latest_release(repo):
@@ -1173,14 +1792,133 @@ def _latest_release(repo):
         return None
 
 
+def _watch_preset_declared(root):
+    """Does this repository's tracked `.supertool.json` enable the `watch` preset?
+
+    Three states, not two: `True`/`False` are a real answer, `None` is "could not
+    tell" -- no such file, or one this process could not parse -- and a caller
+    must not spend the `channel:health` subprocess's own cost finding out the
+    hard way. Measured live while filing #613: with the preset disabled,
+    `supertool 'channel:health'` still exits 1 but prints "op 'channel' is
+    unavailable here", never a `channel: ` line at all -- so skipping the call
+    here also avoids relying on `parse_channel_report` to catch that refusal
+    every single time.
+    """
+    try:
+        data = json.loads((Path(root) / ".supertool.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        # Self-review finding on this issue: `.supertool.json` is a file this
+        # module does not own or control the shape of, and `json.loads` accepts
+        # any valid JSON document -- a bare list, a number, `null`. `.get` on
+        # anything but a dict raised `AttributeError` here with no `except`
+        # above it in `refresh()`'s own call chain, so a malformed-but-parseable
+        # file silently killed the WHOLE detached refresh, not only this field:
+        # board counts and plugin versions stopped updating along with it.
+        return None
+    presets = data.get("presets")
+    if not isinstance(presets, list):
+        return False
+    return "watch" in presets
+
+
+def _run_channel_health(timeout=30):
+    """The raw text of `supertool 'channel:health'`, regardless of its exit code.
+
+    NOT `_run`: that helper returns `None` on any non-zero exit, and `NOT
+    DELIVERING`/`CANNOT DETERMINE`/`CONTRADICTED`/`BOUND, NOT SUBSCRIBED` are
+    all real, distinct findings that exit non-zero on purpose (supertool's own
+    `presets/watch/channel.py`: "a single non-zero would put answers this op
+    exists to separate back into one bucket"). Using `_run` here would fold
+    four of the five real states into the same `None` a missing binary
+    produces, which is the exact defect this field exists to stop happening to
+    the loop's own instrumentation.
+
+    30s, not the 1-3s the issue's own measurement names: that number is the
+    ordinary case, and `MCP_LOOKUP_BUDGET` plus `PS_TIMEOUT` (supertool's own
+    constants) put a documented worst case north of 20s when a lookup is slow
+    rather than merely present.
+    """
+    try:
+        result = subprocess.run(
+            ["supertool", "channel:health"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.decode("utf-8", "replace")
+
+
+def _channel_reading(root, config):
+    """One `channel:health` reading for `refresh()`, or why there is none.
+
+    `(raw_state, attribution)`. `raw_state` is `None` when the `watch` preset
+    is not declared, `.supertool.json` could not be read, the `supertool`
+    binary could not be run, or its report carried no recognisable `channel: `
+    line -- every one of those folds to `cannot_determine` in `channel_status`,
+    never to a guess. `attribution` is independent of all of that, and answers
+    a SEPARATE question: is the channel name this reading came from actually
+    this repository's own (#754, widening #613's own closing bullet). Two
+    independent routes, checked in this order:
+
+    * ``"derivation"`` -- THIS process's own `SUPERTOOL_WATCH_NAME` -- read
+      here, in the detached refresh's own environment, which is the
+      environment the `channel:health` call below actually ran under -- is
+      the name `_expected_watch_name` would derive from this repository's own
+      `.oss.json`. The original and, before #754, the only route.
+    * ``"declaration"`` -- derivation did not match, and a repository whose
+      derived name exceeds supertool's own 32-character path-component cap
+      MUST declare a shorter one in its own tracked `.supertool.json` to use
+      the channel at all (#754's own filing), which makes derivation
+      permanently unsatisfiable for it. A name THIS repository's own tracked
+      file declares is attributable to this repository by the same evidence
+      `doctor.py` already accepts when it reports "declared in
+      .supertool.json and exported as SUPERTOOL_WATCH_NAME, and they match" --
+      so this route asks the identical question: exactly one
+      `ops.*.watch_name` declared (more than one is `not-attributable`, the
+      same as doctor.py's own `conflict` state), and it equals what is
+      actually exported.
+    * ``"declaration-unreadable"`` -- derivation did not match, and
+      `.supertool.json` exists and could not be read or parsed. Never folded
+      into `not-attributable`: a file this module could not open is evidence
+      the question could not be asked, not evidence of someone else's fleet.
+    * ``"not-attributable"`` -- neither route matched (or nothing is
+      declared, or nothing is exported). The socket and poller slots may be
+      another project's fleet entirely, however real the reading itself is.
+
+    Declaration is checked only when derivation did not already settle the
+    question, so a repository that derives cleanly never pays for reading a
+    second file it does not need.
+    """
+    expected = _expected_watch_name(config.get("repo"))
+    actual = os.environ.get(WATCH_NAME_ENV) or None
+    if bool(expected) and expected == actual:
+        attribution = "derivation"
+    else:
+        declared, problem = _declared_watch_names(root)
+        if problem:
+            attribution = "declaration-unreadable"
+        elif actual is not None and len(declared) == 1 and next(iter(declared)) == actual:
+            attribution = "declaration"
+        else:
+            attribution = "not-attributable"
+    if _watch_preset_declared(root) is not True:
+        return None, attribution
+    return parse_channel_report(_run_channel_health()), attribution
+
+
 def refresh(root, now=None):
     """Fill the cache for one managed repository. Runs detached, never on the render path.
 
-    Two clocks (#515). The board -- open pull requests, open issues, their check rollups --
-    is re-read every time; the version each plugin's source repository publishes is re-read
-    only when its own longer interval has passed, and carried forward from the previous
-    cache in between. Four of the seven forge calls were the second kind, which is why the
-    board's own interval could not be shortened while they shared one.
+    Two clocks (#515), soon three (#613). The board -- open pull requests, open issues,
+    who filed each, their check rollups -- is re-read every time; the version each
+    plugin's source repository publishes is re-read only when its own longer interval
+    has passed, and carried forward from the previous cache in between. Four of the
+    eight forge calls are the second kind (#595 added a fourth board call), which is
+    why the board's own interval could not be shortened while they shared one.
 
     A carried-forward value carries its own stamp with it. Stamping it `now` would make an
     hour-old reading indistinguishable from one just taken, which is the same defect this
@@ -1195,7 +1933,23 @@ def refresh(root, now=None):
     if repo:
         document["prs"] = _gh_count(repo, "pr")
         document["issues"] = _gh_count(repo, "issue")
+        document["issues_external"] = _gh_external_issue_count(repo, document["issues"])
         document["pr_checks"] = check_rollup_counts(_gh_rollups(repo), document["prs"])
+        # Same call group, same `fetched_at`, same `stale_after` (#856): the default
+        # branch's own CI state is exactly as time-sensitive as the pull-request board
+        # it sits beside, and it shares the moment (a merge or an issue close in this
+        # session) that already invalidates the rest of the board (#516). A second,
+        # independent clock for one more field would be the interval this repository's
+        # own history already argues against (#515's own reasoning, one field over).
+        # `None` (no default branch configured, or the call did not answer) is a real
+        # value here, not skipped -- `gather()` reads it back and a missing key would
+        # be indistinguishable from a cache written before this field existed, which
+        # is exactly the ambiguity `pr_checks`' own `isinstance` guard exists to avoid.
+        # `_gh_default_branch_state` itself already answers `None` for an unconfigured
+        # `default_branch`, so no separate `if` is needed here.
+        document["default_branch_state"] = _gh_default_branch_state(
+            repo, config.get("default_branch")
+        )
     carried = previous.get("latest")
     carried = dict(carried) if isinstance(carried, dict) else {}
     carried_stamp = previous.get("latest_fetched_at")
@@ -1223,6 +1977,29 @@ def refresh(root, now=None):
             # under its own old stamp, which is what makes it due again immediately.
             document["latest"] = carried
             document["latest_fetched_at"] = carried_stamp
+    if config.get("watch_channel") is False:
+        # A deliberate off switch (#613): no reading, no stamp, and never
+        # carried forward from a previous `on` state -- `channel_status` reads
+        # this back through `gather()` and the field disappears from the line
+        # rather than rendering `?`, which would misstate a decision as a
+        # question nobody could answer.
+        document["channel"] = None
+        document["channel_fetched_at"] = None
+    else:
+        previous_channel_stamp = previous.get("channel_fetched_at")
+        channel_due = not isinstance(previous_channel_stamp, (int, float)) or (
+            now - previous_channel_stamp >= CHANNEL_REFRESH_AFTER
+        )
+        if channel_due:
+            raw_state, attribution = _channel_reading(root, config)
+            document["channel"] = {"raw_state": raw_state, "attribution": attribution}
+            document["channel_fetched_at"] = now
+        else:
+            # Carried forward under its OWN old stamp, same shape as `latest`
+            # above and for the same reason: re-stamping `now` would make an
+            # old reading indistinguishable from a fresh one at the render.
+            document["channel"] = previous.get("channel")
+            document["channel_fetched_at"] = previous_channel_stamp
     path = cache_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -1398,8 +2175,25 @@ def gather(payload, root, now=None):
     config = repo_config(root)
     cache = read_cache(cache_path(config.get("repo")))
     board = board_from_cache(cache, now=now)
-    if board_is_due(cache, now):
+    board_stale = board_is_due(cache, now)
+    if board_stale:
         _fork_refresh(root, config.get("repo"))
+    # Same fold `plugin_facts`/`version_status` already do for `latest` (#550), on
+    # the same board clock `board_is_due` already computes above -- `default_branch`
+    # itself present-but-unconfigured stays `None` (never asked, #613's own
+    # convention), and a configured one whose reading has outlived `board_is_due`'s
+    # own interval (or was marked stale by this session's own merge/close, #516)
+    # folds to `"unknown"` rather than rendering whatever it last said. This is the
+    # one field on this line where a stale `ok` is actively dangerous: #856's own
+    # motivating case is the moment right after a merge, when the previous reading
+    # is confidently green about a commit that no longer exists.
+    default_branch_state = None
+    if config.get("default_branch"):
+        raw_branch_state = (cache or {}).get("default_branch_state")
+        if board_stale or raw_branch_state not in ("green", "bad", "running", "no-run"):
+            default_branch_state = "unknown"
+        else:
+            default_branch_state = raw_branch_state
     latest = (cache or {}).get("latest") or {}
     # `latest_fetched_at` used to be read here and dropped, so `plugin_facts` decided
     # `current`/`behind`/`ahead` with no knowledge of the reading's own age -- the
@@ -1411,6 +2205,26 @@ def gather(payload, root, now=None):
     # invalidating the cache at the moment a publish falsifies it.
     stale_latest = latest_is_due(cache, now)
     loop_name = os.environ.get("OSS_STATUSLINE_PLUGIN", "oss")
+
+    channel = None
+    if config.get("watch_channel") is not False:
+        raw_channel = (cache or {}).get("channel") or {}
+        # `attribution` (a 4-valued string, #754) replaced `attributable` (a
+        # bool, #613) in the cache document. A cache written by the older code
+        # carries only the old key, so this `.get` falls to its default and one
+        # refresh interval's worth of readings render `ch?` on the single
+        # upgrade that crosses #754 -- self-healing at the next `refresh()`,
+        # which rewrites the whole entry. Written down rather than migrated:
+        # translating the old bool would mean asserting WHICH route attributed
+        # a reading this code did not take, and `derivation` was only ever true
+        # by inference. Naming a bounded, self-healing window beats inventing a
+        # provenance for a value that no longer has one.
+        channel = channel_status(
+            raw_channel.get("raw_state"),
+            raw_channel.get("attribution", "not-attributable"),
+            (cache or {}).get("channel_fetched_at"),
+            now,
+        )
 
     # One tail read shared by both transcript-derived facts (#504) -- a render
     # happens on every message, so a second full scan would be a doubled,
@@ -1433,6 +2247,8 @@ def gather(payload, root, now=None):
         "tick": tick,
         "last": _render_stamp(now),
         "plugins": plugin_facts(loop_name, installed_plugins(root), latest, stale=stale_latest),
+        "channel": channel,
+        "default_branch_state": default_branch_state,
     }
 
 
