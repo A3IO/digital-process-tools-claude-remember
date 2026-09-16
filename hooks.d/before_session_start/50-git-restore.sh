@@ -58,11 +58,53 @@ set -u  # not -e -- we never want to fail loudly here
 # and the two tests below cost zero subprocesses.
 [ -n "${REMEMBER_DIR:-}" ] && [ -n "${PROJECT_DIR:-}" ] && [ -n "${PIPELINE_DIR:-}" ] || exit 0
 
-REPO_ROOT="${REMEMBER_DIR%/*}"
-SLUG="${REMEMBER_DIR##*/}"
+# #519: normalize before the parameter-expansion split -- REMEMBER_DIR
+# arrives backslash-separated on msys/cygwin (resolve-paths.sh's own
+# _remember_normalize_win_path), and both `%/*` and `##*/` only ever
+# recognise '/' as the boundary, so without this REPO_ROOT stays equal to
+# the whole (unsplit) REMEMBER_DIR. That does not fail loudly: the later
+# `git -C "$REPO_ROOT" rev-parse --show-toplevel` walks up from the wrong
+# (child) directory, finds the TRUE repo root one level up, the two no
+# longer match, and the "not toplevel" refusal a few lines down fires
+# unconditionally -- so on an affected Windows install with
+# git_restore.enabled=true, the whole restore silently never fires, for
+# every REMEMBER_DIR, legacy or external, with no error surfaced anywhere.
+#
+# This is the identical gate `_remember_forward_slash`
+# (scripts/resolve-paths.sh, #517) applies, duplicated inline rather than
+# calling that function directly: session-start-hook.sh's dispatch() execs
+# this file as its own process (not sourced), so a function defined by
+# resolve-paths.sh in the PARENT process is not in scope here, and this
+# file deliberately does not source resolve-paths.sh itself to keep the
+# "cheap guards first" cost promise two lines above -- sourcing it would
+# make even a legacy-mode install (the majority, which exits right below
+# and can never activate this hook) pay for a config resolution it will
+# never use.
+#
+# PROJECT_DIR is normalized here too (self-review finding), not just
+# REMEMBER_DIR: _remember_normalize_win_path rewrites PROJECT_DIR to
+# BACKSLASH form on msys/cygwin (scripts/resolve-paths.sh, drive-letter
+# branch), the opposite direction from this normalization -- so comparing
+# the now-forward-slashed REPO_ROOT against a still-backslash PROJECT_DIR
+# would make the legacy-mode short-circuit below never match on a genuine
+# legacy install, defeating the exact "cheap guards first" cost promise
+# this normalization exists to protect. scripts/doctor.sh:141 and
+# scripts/lib-case-divergence.sh:162 normalize both sides of this identical
+# REMEMBER_DIR-vs-PROJECT_DIR comparison for the same reason.
+case "${OSTYPE:-}" in
+    msys|cygwin) _gr_normalized_dir="${REMEMBER_DIR//\\//}"
+                 _gr_normalized_project="${PROJECT_DIR//\\//}" ;;
+    *)           _gr_normalized_dir="$REMEMBER_DIR"
+                 _gr_normalized_project="$PROJECT_DIR" ;;
+esac
+REPO_ROOT="${_gr_normalized_dir%/*}"
+SLUG="${_gr_normalized_dir##*/}"
+unset _gr_normalized_dir
 
-# Legacy mode (REMEMBER_DIR is inside PROJECT_DIR) → never run.
-[ "$REPO_ROOT" = "$PROJECT_DIR" ] && exit 0
+# Legacy mode (REMEMBER_DIR is inside PROJECT_DIR) → never run. Compared
+# against the NORMALIZED PROJECT_DIR (see above), not the raw one.
+[ "$REPO_ROOT" = "$_gr_normalized_project" ] && exit 0
+unset _gr_normalized_project
 
 # Prevent outer git env vars from overriding git -C behaviour. Same reasoning
 # as the backup hook: a leaked GIT_DIR makes every `git -C … rev-parse`
@@ -93,6 +135,63 @@ if [ "$(_gr_realpath "$TOPLEVEL")" != "$(_gr_realpath "$REPO_ROOT")" ]; then
     exit 0
 fi
 
+# ── Cheap gate BEFORE sourcing anything (#663, part of #660) ─────────────────
+# session-start-hook.sh's dispatch() runs this file as a CHILD of a process
+# that already sourced log.sh -- which already ran the full three-layer
+# config merge (lib-memory-dir.sh: mktemp, jq -s across up to three files)
+# and log.sh's own one-pass flatten (another jq call) -- and exported the
+# result as REMEMBER_CONFIG. `source log.sh` below is unconditional, so this
+# child redid the ENTIRE merge from scratch, every time, before ever reading
+# whether the hook is even switched on: because `_LIB_MEMORY_DIR_LOADED` is
+# not (and cannot safely be, see the comment on that guard elsewhere in this
+# codebase) exported to the child, sourcing lib-memory-dir.sh here re-runs
+# unconditionally rather than skipping. #253's default is OFF, so this is
+# every dispatch of this hook, on every install that has never touched
+# git_restore, paying for a merge whose answer is never used.
+#
+# The fix is the one the brief names as cheapest: read the flag straight out
+# of the ALREADY-MERGED file the parent exported, with one jq (or python)
+# call, and only pay for the full chain (which this file still needs for the
+# actual restore, and for config()'s other keys below) when that flag says
+# yes. If REMEMBER_CONFIG is not there, is not readable, or neither jq nor
+# python is available to read it, this must not guess "disabled" -- it falls
+# through to the unconditional `source log.sh` + config() gate below
+# unchanged, so a install lacking jq/REMEMBER_CONFIG never silently loses a
+# restore it asked for. This is strictly an optimization: every path below
+# still re-checks the flag through config() before doing anything else.
+_gr_cheap_restore_enabled() {
+    [ -n "${REMEMBER_CONFIG:-}" ] && [ -f "$REMEMBER_CONFIG" ] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.git_restore.enabled // false' "$REMEMBER_CONFIG" 2>/dev/null
+    elif command -v "${PYTHON:-python3}" >/dev/null 2>&1; then
+        "${PYTHON:-python3}" -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+v = d.get("git_restore", {}).get("enabled", False) if isinstance(d, dict) else False
+print("true" if v is True or v == "true" else "false")
+' "$REMEMBER_CONFIG" 2>/dev/null
+    else
+        return 1
+    fi
+}
+_GR_CHEAP_RC=0
+_GR_CHEAP_ENABLED=$(_gr_cheap_restore_enabled) || _GR_CHEAP_RC=$?
+unset -f _gr_cheap_restore_enabled
+if [ "$_GR_CHEAP_RC" -eq 0 ] && [ "$_GR_CHEAP_ENABLED" != "true" ]; then
+    # A definitive "false" from the file the parent already merged. Nothing
+    # sourced, nothing merged twice.
+    exit 0
+fi
+# Either the cheap read said "true" (fall through and let the authoritative
+# check below confirm it once log.sh's config() is available), or it could
+# not answer at all (_GR_CHEAP_RC != 0) -- in which case the unconditional
+# source + gate below is the only source of truth, exactly as before this
+# change.
+
 # ── Now we can afford logging + config ───────────────────────────────────────
 source "$PIPELINE_DIR/scripts/log.sh"
 
@@ -108,6 +207,7 @@ source "$PIPELINE_DIR/scripts/log.sh"
 # from the project's origin at session start. Compare git common dirs, which
 # every worktree of a repo shares.
 _gr_common_dir() {
+    local LC_ALL=C  # bracket ranges below are byte-wise, not collated (#695)
     local _d="$1" _out
     [ -d "$_d" ] || return 1
     _out=$(git -C "$_d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || _out=""

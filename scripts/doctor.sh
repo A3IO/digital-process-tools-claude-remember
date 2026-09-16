@@ -132,7 +132,13 @@ if [ "${1:-}" = "--json" ]; then
 
     source "$SCRIPT_DIR/lib-memory-dir.sh"
 
-    if [ "$REMEMBER_DIR" = "${PROJECT_DIR}/.remember" ] || [[ "$REMEMBER_DIR" == "$PROJECT_DIR"/* ]]; then
+    # #517: both sides forward-slashed before the `==`-glob comparison --
+    # REMEMBER_DIR and PROJECT_DIR both arrive backslash-separated on
+    # msys/cygwin, and `[[ == ]]`'s own glob only ever splits on '/', so an
+    # in-project store misreports as "external" there for any REMEMBER_DIR
+    # that is not the literal default `${PROJECT_DIR}/.remember`.
+    if [ "$REMEMBER_DIR" = "${PROJECT_DIR}/.remember" ] \
+        || [[ "$(_remember_forward_slash "$REMEMBER_DIR")" == "$(_remember_forward_slash "$PROJECT_DIR")"/* ]]; then
         _JSON_STORAGE_MODE="legacy"
     else
         _JSON_STORAGE_MODE="external"
@@ -315,7 +321,12 @@ echo ""
 # ── 4. Storage mode ──────────────────────────────────────────────────────────
 echo "-- Storage --"
 
-if [ "$REMEMBER_DIR" = "${PROJECT_DIR}/.remember" ] || [[ "$REMEMBER_DIR" == "$PROJECT_DIR"/* ]]; then
+# #517: both sides forward-slashed before the `==`-glob comparison -- see
+# the JSON-mode branch above for why an unnormalized REMEMBER_DIR/
+# PROJECT_DIR here misreports an in-project store as "external" on
+# msys/cygwin.
+if [ "$REMEMBER_DIR" = "${PROJECT_DIR}/.remember" ] \
+    || [[ "$(_remember_forward_slash "$REMEMBER_DIR")" == "$(_remember_forward_slash "$PROJECT_DIR")"/* ]]; then
     echo "OK   Storage mode: legacy (in-project: $REMEMBER_DIR)"
 else
     echo "OK   Storage mode: external ($REMEMBER_DIR)"
@@ -425,10 +436,13 @@ fi
 #
 # No new marker is written for this. session-end-hook.sh already leaves
 # usable evidence of its own accord, as a side effect of its background
-# flush: a logs/autonomous/session-end-<HHMMSS>.log file, created
+# flush: a logs/autonomous/session-end-<HHMMSS>-<PID>.log file, created
 # unconditionally once that hook gets past its own SAVE_SCRIPT-missing check
 # (see session-end-hook.sh's own comments around its `_END_LOG` redirect).
-# Presence of even one such file is proof the hook has run; absence needs a
+# The `-<PID>` suffix (#488) is why the glob below stays a plain
+# `session-end-*.log`, not `session-end-??????.log` -- narrowing it to the
+# old fixed-width shape would stop matching the very files this hook now
+# writes. Presence of even one such file is proof the hook has run; absence needs a
 # second signal before it can be called a problem, since a hook that never
 # had the chance to fire yet is not the same as one that had the chance and
 # stayed silent — the third state the issue calls out by name.
@@ -452,7 +466,13 @@ fi
 # only that the opportunity existed and the window for it has passed.
 _SESSION_END_LOG_DIR="$REMEMBER_DIR/logs/autonomous"
 _SESSION_END_FIRED=0
-for _sel in "$_SESSION_END_LOG_DIR"/session-end-*.log; do
+# #524: normalize before the glob -- REMEMBER_DIR arrives backslash-
+# separated on msys/cygwin, and bash's glob only ever splits on '/', so
+# without this _SESSION_END_FIRED silently stays 0 there and doctor falls
+# through to its transcript heuristic, misreporting SessionEnd as never
+# having fired for a project that genuinely has one.
+_remember_session_end_glob_dir=$(_remember_forward_slash "$_SESSION_END_LOG_DIR")
+for _sel in "$_remember_session_end_glob_dir"/session-end-*.log; do
     [ -f "$_sel" ] && _SESSION_END_FIRED=1 && break
 done
 
@@ -599,8 +619,12 @@ fi
 _MEMORY_FILE_COUNT=0
 _MEMORY_BYTES=0
 if [ -d "$REMEMBER_DIR" ]; then
+    # #525: normalize before the glob -- see #524's comment above for why
+    # an unnormalized REMEMBER_DIR here means this operator-facing total
+    # silently undercounts to 0 on msys/cygwin.
+    _remember_memory_glob_dir=$(_remember_forward_slash "$REMEMBER_DIR")
     for _pattern in "today-"'*.md' "now.md" "recent.md" "archive"'*.md'; do
-        for _mf in "$REMEMBER_DIR"/$_pattern; do
+        for _mf in "$_remember_memory_glob_dir"/$_pattern; do
             [ -f "$_mf" ] || continue
             _MEMORY_FILE_COUNT=$((_MEMORY_FILE_COUNT + 1))
             _mf_bytes=$(wc -c < "$_mf" 2>/dev/null | tr -d ' ')
@@ -711,8 +735,13 @@ else
     else
         _DOCTOR_TODAY=$(date '+%Y-%m-%d')
     fi
+    # #517: normalize before the glob -- REMEMBER_DIR arrives backslash-
+    # separated on msys/cygwin, and bash's glob only ever splits on '/', so
+    # without this _STAGING_BYTES silently undercounts to 0 there, a
+    # number printed directly to the operator two branches below.
+    _remember_staging_bytes_glob_dir=$(_remember_forward_slash "$REMEMBER_DIR")
     _STAGING_BYTES=0
-    for _sf in "$REMEMBER_DIR"/today-*.md; do
+    for _sf in "$_remember_staging_bytes_glob_dir"/today-*.md; do
         [ -f "$_sf" ] || continue
         case "${_sf##*/}" in
             (*.done.md) continue ;;
@@ -824,8 +853,13 @@ if [ -f "$_ROTATE_STATE" ]; then
     _RT_COUNT=$(sed -n 1p "$_ROTATE_STATE" 2>/dev/null)
     _RT_WHEN=$(sed -n 2p "$_ROTATE_STATE" 2>/dev/null)
     _RT_ERR=$(sed -n 3p "$_ROTATE_STATE" 2>/dev/null)
+    # #517: normalize before the glob -- see the _STAGING_BYTES comment
+    # above for why an unnormalized REMEMBER_DIR here means $_RT_PENDING
+    # silently undercounts to 0 on msys/cygwin, another number printed
+    # directly to the operator two lines below.
+    _remember_rt_pending_glob_dir=$(_remember_forward_slash "$REMEMBER_DIR")
     _RT_PENDING=0
-    for _rt_f in "$REMEMBER_DIR"/logs/memory-*.log; do
+    for _rt_f in "$_remember_rt_pending_glob_dir"/logs/memory-*.log; do
         [ -f "$_rt_f" ] && _RT_PENDING=$((_RT_PENDING + 1))
     done
     echo "WARN Log rotation has failed ${_RT_COUNT:-?} time(s) in a row (last ${_RT_WHEN:-unknown})"

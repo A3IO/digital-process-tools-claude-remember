@@ -100,7 +100,13 @@ dispatch "before_consolidate"
 # script) and the EXIT trap removes it on every path, including the two failure
 # exits below. A SIGKILL leaves one behind holding a copy of bytes that also
 # still exist in staging — no recovery is owed, so the sweep is tidiness.
-rm -rf "${REMEMBER_DIR}"/tmp/consolidate-snapshot-* 2>/dev/null || true
+# #517: normalize the glob's own directory argument before matching --
+# REMEMBER_DIR arrives backslash-separated on msys/cygwin, and bash's glob
+# recognises only '/' as a path separator, so an unnormalized directory
+# here silently sweeps nothing there (mktemp two lines below needs no such
+# fix -- it builds the path directly, and MSYS translates that syscall).
+_remember_consolidate_glob_dir=$(_remember_forward_slash "$REMEMBER_DIR")
+rm -rf "${_remember_consolidate_glob_dir}"/tmp/consolidate-snapshot-* 2>/dev/null || true
 SNAPSHOT_DIR=$(mktemp -d "${REMEMBER_DIR}/tmp/consolidate-snapshot-XXXXXX")
 # Losing this wait costs a round and nothing else: nothing has been read, so
 # staging, recent.md and archive.md are all exactly as they were and the next
@@ -233,7 +239,14 @@ while IFS= read -r -d '' staging_path && IFS= read -r -d '' staging_consumed; do
         # crash between mktemp and mv leaves a stray sibling; sweep it first,
         # same as #245 — inert (name does not end in .md, so nothing globs it)
         # but would accumulate one per failure otherwise.
-        rm -f "${staging_path}".tail-* "${staging_path}".prefix-* 2>/dev/null
+        # #526: normalize before the glob -- staging_path inherits
+        # REMEMBER_DIR's backslashes on msys/cygwin, and bash's glob only
+        # ever splits on '/', so without this the sweep silently never
+        # matches there and a stray .tail-*/.prefix-* sibling accumulates
+        # per failed split, same class as the snapshot sweep above
+        # (_remember_consolidate_glob_dir).
+        _remember_staging_rm_glob=$(_remember_forward_slash "$staging_path")
+        rm -f "${_remember_staging_rm_glob}".tail-* "${_remember_staging_rm_glob}".prefix-* 2>/dev/null
         staging_tail=$(mktemp "${staging_path}.tail-XXXXXX")
         # Extracted into a FRESH temp file, never straight into staging_done
         # (self-review of #509, Explore finding 1): an earlier draft wrote the
@@ -312,6 +325,19 @@ staging_lock_release
 rm -f "$STAGING_PATHS_FILE"
 
 log "consolidation" "done: ${STAGING_COUNT} files consolidated"
+
+# --- Pre-render the SessionStart MEMORY context cache (#668) ---
+# This script only ever runs via `nohup ... & disown` (session-start-hook.sh's
+# own consolidation trigger launches it detached), so everything from here on
+# is already outside the interactive session. Consolidation is exactly the
+# operation that rotates archive.md/recent.md and rewrites core-memories.md,
+# so refreshing the cache here -- after those files have landed -- is what
+# lets the NEXT SessionStart skip re-reading and re-sizing them.
+PLUGIN_ROOT="${PLUGIN_ROOT:-$PIPELINE_DIR}"
+if source "$(dirname "$0")/lib-memory-context.sh" 2>/dev/null; then
+    _remember_memory_paths
+    _remember_start_cache_context_publish
+fi
 
 # --- Dispatch: after_consolidate ---
 dispatch "after_consolidate"

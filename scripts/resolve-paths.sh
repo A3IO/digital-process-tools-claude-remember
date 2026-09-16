@@ -35,8 +35,14 @@
 # ENVIRONMENT (inputs)
 #   CLAUDE_PROJECT_DIR    Project root (set by Claude Code hooks)
 #   REMEMBER_HOOK_CWD     Fallback project root (#411), consulted when
-#                         CLAUDE_PROJECT_DIR is unset -- Codex and Gemini CLI
-#                         never set the latter. Exported by
+#                         CLAUDE_PROJECT_DIR is unset -- confirmed still true
+#                         of Codex (live-observed, #463) but no longer of
+#                         Gemini CLI, whose own bundled docs say it sets
+#                         CLAUDE_PROJECT_DIR as a compatibility alias (#456,
+#                         unverified live -- #532). This fallback stays
+#                         correct and needed regardless: it exists for ANY
+#                         host that leaves CLAUDE_PROJECT_DIR unset, Codex
+#                         included, not only for Gemini. Exported by
 #                         session-start-hook.sh / session-end-hook.sh from the
 #                         SessionStart/SessionEnd stdin payload's `cwd` field;
 #                         not read from stdin here (see the caller comments).
@@ -200,6 +206,7 @@ fi
 # The drive-form regex lives in a variable: a bracket expression containing a
 # backslash is not portable to write inline on the right of `=~`.
 _remember_normalize_win_path() {
+    local LC_ALL=C  # bracket ranges below are byte-wise, not collated (#695)
     local _in="$1" _drive="" _rest=""
     local _re='^([a-zA-Z]):[/\](.*)$'
     case "$OSTYPE" in
@@ -217,7 +224,15 @@ _remember_normalize_win_path() {
                 _rest="${BASH_REMATCH[2]}"
             fi
             if [ -n "$_drive" ]; then
-                _drive=$(printf '%s' "$_drive" | tr '[:lower:]' '[:upper:]')
+                # `LC_ALL=C` on the command, not just the function's `local`:
+                # `local` on a name the environment never exported leaves it
+                # unexported, so the child keeps the caller's locale. On a host
+                # whose language is set through LANG alone -- what setting a
+                # system language actually produces -- Turkish case rules then
+                # map `i` to the dotted `İ`, two bytes in a slot that holds one
+                # ASCII drive letter. The `local` above still does its own job:
+                # the bracket ranges bash matches itself (#695).
+                _drive=$(printf '%s' "$_drive" | LC_ALL=C tr '[:lower:]' '[:upper:]')
                 _rest="${_rest//\//\\}"
                 printf '%s' "${_drive}:\\${_rest}"
                 return 0
@@ -225,6 +240,55 @@ _remember_normalize_win_path() {
             ;;
     esac
     printf '%s' "$_in"
+}
+
+# --- Portable-glob helper (#517) -------------------------------------------
+#
+# Bash's own filename glob (`*`/`?`/`[...]`) and its parameter-expansion
+# pattern matching (`%`/`##`/a `[[ == ]]` glob) both recognise ONLY '/' as a
+# path-component separator -- POSIX glob(3)'s own definition of a pathname,
+# not a filesystem property -- so on msys/cygwin, where REMEMBER_DIR (and
+# PROJECT_DIR, via _remember_normalize_win_path above) arrive backslash-
+# separated, every such operation against them silently matches nothing.
+# #487 (PR #499) fixed this once, inline, for scripts/save-session.sh's own
+# retention sweep; this is the same fix extracted so every later call site
+# (#517) reuses one mechanism instead of re-deriving the $OSTYPE gate.
+#
+# Gated on $OSTYPE, not applied unconditionally, for the same reason
+# _remember_normalize_win_path above is: a literal backslash is an ordinary,
+# legal filename character on POSIX, and _remember_normalize_win_path (the
+# thing that puts backslashes into these variables in the first place) is
+# itself gated the identical way -- so a POSIX path never carries a
+# separator-shaped backslash to begin with, and unconditionally rewriting
+# one would mangle a real POSIX directory whose name happens to contain a
+# literal `\` into a different, generally nonexistent path.
+#
+# Deliberately NOT `unset -f`'d below the way _remember_normalize_win_path
+# is: every caller of this file that needs to glob or pattern-match against
+# REMEMBER_DIR/PROJECT_DIR sources it AFTER this file runs, so the function
+# has to still be callable then, unlike the normalize helper above, which is
+# only ever used inline, above, within this same file.
+_remember_forward_slash() {
+    case "$OSTYPE" in
+        msys|cygwin) printf '%s' "${1//\\//}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# _remember_forward_slash_into VARNAME VALUE
+# Same answer as _remember_forward_slash, written into VARNAME with
+# `printf -v` instead of printed -- so a caller doing `X=$(_remember_forward_slash
+# "$Y")` can have it with no command-substitution subshell at all (#665, part
+# of #660). `_remember_forward_slash` itself already forks nothing (`case` and
+# a parameter expansion, no external process) -- the fork this removes is the
+# one `$( )` was adding purely to capture that already-forkless function's
+# stdout, the same class `_remember_date_into` (lib-clock.sh, #511) and
+# config_into (log.sh, #665) remove for their own callers.
+_remember_forward_slash_into() {
+    case "$OSTYPE" in
+        msys|cygwin) printf -v "$1" '%s' "${2//\\//}" ;;
+        *) printf -v "$1" '%s' "$2" ;;
+    esac
 }
 
 # --- Resolve PROJECT_DIR (the user's project root) ---
@@ -237,10 +301,15 @@ _remember_normalize_win_path() {
 #      `cwd` field, exported by the hook that read this file, from its own
 #      stdin -- every hook this plugin registers now offers one (session-start
 #      and session-end since #411; user-prompt and post-tool since #444).
-#      Codex and Gemini CLI both put `cwd` on that payload but neither sets
-#      CLAUDE_PROJECT_DIR (Codex documents no such variable at all; Gemini
-#      documents no hook environment variables whatsoever), so this is the
-#      fallback that makes resolution possible on either host. Not every
+#      Both Codex and Gemini CLI put `cwd` on that payload. Codex still
+#      documents no CLAUDE_PROJECT_DIR variable at all (live-confirmed,
+#      #463), so this fallback is still what makes resolution possible on
+#      Codex. Gemini CLI's own bundled docs now claim it DOES set
+#      CLAUDE_PROJECT_DIR, as a compatibility alias (#456) -- unverified
+#      live, #532 -- in which case priority 1 above wins for Gemini and this
+#      fallback is simply never reached on that host; it stays correct and
+#      needed for Codex and any other host that genuinely leaves
+#      CLAUDE_PROJECT_DIR unset. Not every
 #      caller of this file is a hook with stdin to read -- doctor.sh and a
 #      bare `source` from a shell have none -- so an unset or unusable value
 #      here is silently skipped, same as an unset CLAUDE_PROJECT_DIR above.

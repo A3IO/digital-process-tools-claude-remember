@@ -255,13 +255,43 @@ def _choose_summarizer_provider() -> str:
                 "back to 'claude', which may not be correct"
             )
         return "claude"
-    envelope = _extract.sniff_file_envelope(path)
+    envelope, envelope_unreadable, envelope_capped = _extract.sniff_file_envelope_status(path)
     if envelope == "codex":
         return "codex"
+    if envelope == "antigravity":
+        # #567: Antigravity has no summarizer provider of its own --
+        # _SUMMARIZER_PROVIDERS is still {"claude", "codex", "auto"} -- so
+        # "claude" is the correct answer here, the same as it is for a
+        # genuine Claude Code transcript. But unlike Claude Code, this is
+        # a DIFFERENT host's session being billed through `claude -p`, the
+        # exact shape #460/#477 already warn about elsewhere in this
+        # function; teaching sniff_envelope() the Antigravity shape (#563)
+        # moved this transcript out of the "unrecognised" arm below -- the
+        # only arm that used to warn -- into a silent fall-through, with
+        # no receipt for an operator debugging a wrongly-billed session.
+        _warn(
+            f"WARNING: transcript {path!r} is an Antigravity session -- "
+            "REMEMBER_SUMMARIZER=auto has no Antigravity-native summarizer "
+            "and is falling back to 'claude'"
+        )
+        return "claude"
     if envelope == "unrecognised":
+        # #556: "unreadable or an unrecognised shape" used to be the whole
+        # story, but it collapsed a THIRD cause into "unrecognised shape" --
+        # the scan giving up at extract._ENVELOPE_SNIFF_SCAN_CAP without
+        # ever exhausting the file. sniff_file_envelope_status() (rather
+        # than the plain sniff_file_envelope() this used to call) is what
+        # makes the cap visible here, so the warning can name it instead of
+        # misfiling it under a shape genuinely never recognised.
+        if envelope_unreadable:
+            reason = "unreadable"
+        elif envelope_capped:
+            reason = "gave up after scanning too many unplaceable lines"
+        else:
+            reason = "an unrecognised shape"
         _warn(
             f"WARNING: could not identify the host from transcript {path!r} "
-            "(unreadable or an unrecognised shape) -- REMEMBER_SUMMARIZER=auto "
+            f"({reason}) -- REMEMBER_SUMMARIZER=auto "
             "is falling back to 'claude', which may not be correct"
         )
     return "claude"

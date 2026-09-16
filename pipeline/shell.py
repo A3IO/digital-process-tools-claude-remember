@@ -33,6 +33,7 @@ import sys
 
 from .extract import (
     _is_line_number,
+    _validate_session_id,
     clear_unread_envelope,
     extract_session,
     mark_unread_envelope,
@@ -84,7 +85,8 @@ def cmd_extract(session_id: str, project_dir: str) -> None:
     Prints:
         POSITION, HUMAN_COUNT, ASSISTANT_COUNT, EXCHANGE_COUNT,
         EXTRACT_FILE (path to temp file containing exchange text), ENVELOPE,
-        SKIP_LINES, UNREAD_SIDECAR_UNREADABLE, ENVELOPE_UNREADABLE.
+        SKIP_LINES, UNREAD_SIDECAR_UNREADABLE, ENVELOPE_UNREADABLE,
+        ENVELOPE_CAPPED, ENVELOPE_HAS_UNMAPPED_STEP.
     """
     import tempfile
     remember_dir = os.environ.get("REMEMBER_DIR") or None
@@ -132,6 +134,19 @@ def cmd_extract(session_id: str, project_dir: str) -> None:
     # every "unrecognised" case at the shape-sniffing function even when the
     # real answer is "the file could not be read at all".
     print(f"ENVELOPE_UNREADABLE={1 if r.envelope_unreadable else 0}")
+    # #556: ENVELOPE="unrecognised" with ENVELOPE_UNREADABLE=0 still collapses
+    # two different causes -- a file read to genuine exhaustion without ever
+    # naming a known host shape, and one that hit
+    # extract._ENVELOPE_SNIFF_SCAN_CAP and gave up before exhausting the
+    # file. Additive for the same reason as the two keys above: no current
+    # consumer reads this yet, but the distinction is on the bridge.
+    print(f"ENVELOPE_CAPPED={1 if r.envelope_capped else 0}")
+    # #575: distinct from ENVELOPE=="unrecognised" -- this fires for a KNOWN
+    # envelope (today, only "antigravity") whose read span still contained a
+    # step this build's pipeline.host adapter cannot map to a role. Read
+    # unconditionally by scripts/save-session.sh, so it prints 0 rather than
+    # being omitted for every other envelope.
+    print(f"ENVELOPE_HAS_UNMAPPED_STEP={1 if r.envelope_has_unmapped_step else 0}")
 
 
 def cmd_build_prompt(
@@ -333,6 +348,7 @@ def cmd_save_position(
             when ``envelope`` is ``"unrecognised"``; falls back to
             ``position`` if omitted.
     """
+    _validate_session_id(session_id)
     sessions = read_positions(last_save_file)
     # Re-insert at the end: dicts keep insertion order, so the oldest entry is
     # simply the first one, and a session that keeps saving keeps its slot.
@@ -393,10 +409,16 @@ def cmd_save_position(
     # #140 fixed for last-save.json, reintroduced through its own mirror.
     # Best-effort: a session that is gone from the store losing its sidecar a
     # little late (a failed unlink here) is no worse than #353 not existing.
+    # `evicted_id` comes from a key already present in the persisted store, so
+    # a store written before #538 -- or hand-edited -- can hold one that fails
+    # `_validate_session_id` today. That must not abort the save that has
+    # already landed above: treat a rejected id the same as a failed unlink,
+    # never let it become worse than #353 not existing.
     for evicted_id in evicted:
         try:
+            _validate_session_id(evicted_id)
             os.remove(os.path.join(sidecar_dir, f"position.{evicted_id}"))
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     # #450: keep the unread-envelope quarantine in step with the position it

@@ -150,8 +150,11 @@ unset REMEMBER_TRANSCRIPT_PATH
 # anything else wants it -- including resolve-paths.sh below, which is new
 # with #444: only session-start-hook.sh and session-end-hook.sh used to have
 # a stdin `cwd` to offer it, so a host that never sets CLAUDE_PROJECT_DIR
-# (Codex, Gemini CLI) hit the FATAL in resolve-paths.sh on every PostToolUse
-# call. PostToolUse carries `cwd` on the same payload as `session_id`
+# (Codex -- still true, live-confirmed #463; Gemini CLI was believed the
+# same at the time but its own docs now say it sets CLAUDE_PROJECT_DIR as a
+# compatibility alias, #456, unverified live -- #532) hit the FATAL in
+# resolve-paths.sh on every PostToolUse call. PostToolUse carries `cwd` on
+# the same payload as `session_id`
 # (#407's comparison table), so the capture that already existed for
 # session_id moves up here to feed both.
 #
@@ -397,9 +400,28 @@ fi
 STDIN_SESSION_ID=$(_stdin_json_string session_id "$HOOK_STDIN" 2>/dev/null) || STDIN_SESSION_ID=""
 # stdin is not more trustworthy than a basename. The id becomes both a path
 # component under capture-alive.d/ and a transcript filename, so it faces the
-# same guard the basename-derived id has always faced, at the point of entry.
+# same guard the basename-derived id now faces too (#620) -- both are
+# sanitised at their own point of entry, this one here and the other where
+# SESSION_ID is derived from TRANSCRIPT below.
+#
+# #610: this value also reaches save-session.sh's argv, unchanged, on the
+# background nohup save path below (`nohup "$SAVE_SCRIPT" "$SESSION_ID" ...
+# &`), and that script's own arg loop treats a leading-dash value as a FLAG
+# rather than a positional session id (`--dry) DRY_RUN=true ;;`) -- the
+# character class here has never excluded a leading dash, exactly the gap
+# #576 already closed at the sibling agy-stop-hook.sh call site (merged),
+# and #600 is fixing the same gap at session-end-hook.sh (PR #609, not yet
+# merged as of this commit -- do not read that sibling file as fixed until
+# it lands). Without `-*`, a session_id of
+# "--dry" passes this guard untouched and, paired with a real
+# transcript_path, is trusted by the STDIN_SESSION_ID_TRUSTED branch below
+# (which only checks that a transcript_path was given, not that this id
+# names it -- an established #468 trust decision this fix does not revisit)
+# -- silently turning a real delta-triggered save into a no-op dry-run
+# preview: no summary written, no position advanced, log line reads like an
+# ordinary run.
 case "$STDIN_SESSION_ID" in
-    ''|.|..|*[!A-Za-z0-9._-]*) STDIN_SESSION_ID="" ;;
+    ''|.|..|-*|*[!A-Za-z0-9._-]*) STDIN_SESSION_ID="" ;;
 esac
 
 # ── The transcript path the host handed us (#459, mirroring #407/#424) ────
@@ -583,6 +605,16 @@ if [ "$STDIN_SESSION_ID_TRUSTED" = true ]; then
 else
     SESSION_ID="${TRANSCRIPT##*/}"
     SESSION_ID="${SESSION_ID%.jsonl}"
+    # #620: the basename route faced no guard at all before this line was
+    # added -- this value reaches save-session.sh's argv unchanged, on the
+    # very same background nohup save path #610 already guards
+    # STDIN_SESSION_ID for (post-tool-hook.sh:419-423). Same character
+    # class, same reason: `-*` rejects a leading dash so a transcript
+    # basename that happens to collide with save-session.sh's own `--dry`/
+    # `--force` flags cannot be misread as one.
+    case "$SESSION_ID" in
+        ''|.|..|-*|*[!A-Za-z0-9._-]*) SESSION_ID="" ;;
+    esac
 fi
 
 # Which session PostToolUse serviced, for the capture-gap check in
@@ -858,6 +890,20 @@ fi
 # read the resolved value (#350).
 DELTA_THRESHOLD="${REMEMBER_DELTA_THRESHOLD:-50}"
 if [ "$DELTA" -gt "$DELTA_THRESHOLD" ] && [ "$IN_COOLDOWN" = false ]; then
+  if [ -z "$SESSION_ID" ]; then
+    # #633: the #620 sanitiser above can empty SESSION_ID when the
+    # transcript basename fails the character class, and this fork is the
+    # ONLY remaining consumer of it on the basename route -- unlike the
+    # stdin route, which has STDIN_SESSION_ID_TRUSTED gating every use of
+    # STDIN_SESSION_ID behind `[ -n "$STDIN_SESSION_ID" ]`
+    # (post-tool-hook.sh:419-423), there is no further fallback here to
+    # fall through to. An empty value is not "trusted", it is absent
+    # (post-tool-hook.sh:561-563) -- save-session.sh reads an empty argv[1]
+    # as "no id given" and silently substitutes the newest .jsonl by mtime
+    # (save-session.sh:273-275) rather than refusing, so the fork must be
+    # skipped here rather than let that happen.
+    log "hook" "post-tool: transcript basename \"${TRANSCRIPT##*/}\" failed the session id sanitiser -- refusing to save rather than handing save-session.sh an empty id"
+  else
     ALREADY_RUNNING=false
     if [ -f "$PID_FILE" ]; then
         OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
@@ -868,10 +914,30 @@ if [ "$DELTA" -gt "$DELTA_THRESHOLD" ] && [ "$IN_COOLDOWN" = false ]; then
 
     if [ "$ALREADY_RUNNING" = false ]; then
         mkdir -p "$REMEMBER_DIR/logs/autonomous"
-        nohup "$SAVE_SCRIPT" "$SESSION_ID" > "$REMEMBER_DIR/logs/autonomous/save-$(_remember_date +%H%M%S).log" 2>&1 &
+        _SAVE_LOG="$REMEMBER_DIR/logs/autonomous/save-$(_remember_date +%H%M%S).log"
+        # Seeded with a header line BEFORE the backgrounded save-session.sh
+        # ever opens it, and the nohup redirect below appends (`>>`) rather
+        # than truncates (`>`) -- same defence session-end-hook.sh already
+        # gives $_END_LOG (scripts/session-end-hook.sh:296-311, #483),
+        # applied here for #527: save-session.sh's own housekeeping sweep
+        # (unconditional on every flush since #498, not tied to its NDC
+        # step) reclaims any *.log in this same directory that is still
+        # empty when it runs -- and on an ordinary flush save-session.sh's
+        # own log() writes to its daily narrative file, never to
+        # stdout/stderr, so a `>`-truncated, still-open $_SAVE_LOG is
+        # exactly what that sweep -- run from INSIDE the very process
+        # writing into it -- matches and deletes. A non-empty file at open
+        # time is never `-empty`, so it survives its own run's housekeeping
+        # while a genuinely stale, still-empty log from an abandoned run is
+        # untouched by this and keeps getting swept exactly as before.
+        if ! printf '%s [post-tool] save triggered\n' "$(_remember_date +%H:%M:%S)" >> "$_SAVE_LOG" 2>/dev/null; then
+            log "hook" "WARNING: could not seed $_SAVE_LOG -- if this file stays absent or empty, an ordinary housekeeping sweep will reclaim it while this flush is still writing to it"
+        fi
+        nohup "$SAVE_SCRIPT" "$SESSION_ID" >> "$_SAVE_LOG" 2>&1 &
         echo $! > "$PID_FILE"
         SAVE_TRIGGERED="true"
     fi
+  fi
 fi
 
 # --- Dispatch: after_post_tool ---

@@ -100,7 +100,7 @@ POST_TOOL = REPO_ROOT / "scripts" / "post-tool-hook.sh"
 LIB_SLUG = REPO_ROOT / "scripts" / "lib-slug.sh"
 LIB_MEMORY_DIR = REPO_ROOT / "scripts" / "lib-memory-dir.sh"
 
-# The one sanctioned executable-code divergence from origin/main for
+# The sanctioned executable-code divergences from origin/main for
 # test_the_per_tool_call_path_is_not_touched's byte-pin arms, keyed by the
 # relative path it applies to -- see that test's docstring for why. Applied
 # to the origin/main side before the compare, so anything else that diverges
@@ -110,10 +110,10 @@ LIB_MEMORY_DIR = REPO_ROOT / "scripts" / "lib-memory-dir.sh"
 # survives into the joined "code lines only" text and must be matched here
 # too -- these `\n\n`s are not decoration, they are load-bearing whitespace.
 def _apply_sanctioned_divergence(ref_code: str, rel: str) -> str:
-    """Apply the one sanctioned old-to-new substitution for `rel`, if any.
+    """Apply each sanctioned old-to-new substitution for `rel`, if any.
 
-    Three states, not two (#440) -- the two-state version failed on
-    origin/main the instant its own allowance's PR merged:
+    Three states per substitution, not two (#440) -- the two-state version
+    failed on origin/main the instant its own allowance's PR merged:
 
     - `old_code` is on origin/main: the substitution's own PR is still open
       (or the byte-compare is being run against a base that predates it).
@@ -121,25 +121,134 @@ def _apply_sanctioned_divergence(ref_code: str, rel: str) -> str:
       fix rather than the noise it has not yet replaced.
     - `old_code` is gone AND `new_code` is on origin/main: the post-merge
       steady state -- the sanctioned fix has already landed on origin/main.
-      Nothing to substitute; return ref_code unchanged rather than asserting.
+      Nothing to substitute; leave ref_code unchanged rather than asserting.
     - Neither is on origin/main: genuinely stale. origin/main moved again and
       this allowance needs re-deriving, not blindly (re-)applied.
+
+    A file may carry more than one allowance (#429 and #662 both touch
+    lib-memory-dir.sh); they are applied in order, each judged on its own.
     """
-    if rel not in _SANCTIONED_DIVERGENCE:
-        return ref_code
-    old_code, new_code = _SANCTIONED_DIVERGENCE[rel]
-    if old_code in ref_code:
-        return ref_code.replace(old_code, new_code)
-    assert new_code in ref_code, (
-        f"{rel}: neither the old nor the new code of this sanctioned "
-        "substitution is on origin/main -- origin/main has moved and this "
-        "allowance needs re-deriving, not blindly re-applying"
-    )
+    for old_code, new_code in _SANCTIONED_DIVERGENCE.get(rel, ()):
+        if old_code in ref_code:
+            ref_code = ref_code.replace(old_code, new_code)
+            continue
+        assert new_code in ref_code, (
+            f"{rel}: neither the old nor the new code of this sanctioned "
+            "substitution is on origin/main -- origin/main has moved and this "
+            "allowance needs re-deriving, not blindly re-applying"
+        )
     return ref_code
 
 
+# `_LAZY_PYTHON_GUARD` is the #662 line: a `declare -f` builtin check that
+# resolves $PYTHON on first use when detect-tools.sh was sourced in lazy mode
+# and is a no-op everywhere else. It adds no spawn of its own -- it sits
+# immediately before a python spawn that was already there, on branches that
+# only run when that spawn runs -- which is why it is sanctioned here rather
+# than moved off the hot path.
+_LAZY_PYTHON_GUARD = 'declare -f _remember_python >/dev/null 2>&1 && _remember_python\n'
+
 _SANCTIONED_DIVERGENCE = {
-    "scripts/lib-memory-dir.sh": (
+    "scripts/lib-slug.sh": [
+        (
+            '                    local _decoded\n'
+            '                    _decoded=$("${PYTHON:-python3}" "$_py_slug" "$path" 2>/dev/null) \\\n',
+            '                    local _decoded\n'
+            '                    ' + _LAZY_PYTHON_GUARD +
+            '                    _decoded=$("${PYTHON:-python3}" "$_py_slug" "$path" 2>/dev/null) \\\n',
+        ),
+        (
+            '    if [ -f "$_slug_py" ]; then\n'
+            '        _hash=$("${PYTHON:-python3}" "$_slug_py" --hash "$_orig" 2>/dev/null) || _hash=""\n',
+            '    if [ -f "$_slug_py" ]; then\n'
+            '        ' + _LAZY_PYTHON_GUARD +
+            '        _hash=$("${PYTHON:-python3}" "$_slug_py" --hash "$_orig" 2>/dev/null) || _hash=""\n',
+        ),
+        (
+            '_remember_build_slug_sed() {\n'
+            '    local cont\n'
+            '    cont="$(printf \'\\200\')-$(printf \'\\277\')"\n'
+            '    _REMEMBER_SLUG_SED=(\n'
+            '        -e "s/$(printf \'\\360\')[$(printf \'\\220\')-$(printf \'\\277\')][$cont][$cont]/--/g"\n'
+            '        -e "s/[$(printf \'\\361\')-$(printf \'\\363\')][$cont][$cont][$cont]/--/g"\n'
+            '        -e "s/$(printf \'\\364\')[$(printf \'\\200\')-$(printf \'\\217\')][$cont][$cont]/--/g"\n'
+            '        -e "s/$(printf \'\\340\')[$(printf \'\\240\')-$(printf \'\\277\')][$cont]/-/g"\n'
+            '        -e "s/[$(printf \'\\341\')-$(printf \'\\354\')][$cont][$cont]/-/g"\n'
+            '        -e "s/$(printf \'\\355\')[$(printf \'\\200\')-$(printf \'\\237\')][$cont]/-/g"\n'
+            '        -e "s/[$(printf \'\\356\')-$(printf \'\\357\')][$cont][$cont]/-/g"\n'
+            '        -e "s/[$(printf \'\\302\')-$(printf \'\\337\')][$cont]/-/g"\n'
+            "        -e 's/[^a-zA-Z0-9]/-/g'\n"
+            '    )\n'
+            '}\n'
+            '_remember_build_slug_sed\n',
+            # #665 (part of #660): ANSI-C octal quoting instead of
+            # $(printf ...) -- byte-identical output, proved by
+            # tests/test_session_start_fork_tax_665.py::
+            # test_slug_sed_program_is_byte_identical_to_the_old_printf_builder,
+            # replacing 22 subshell forks with a lexer-level substitution
+            # that forks nothing.
+            '_remember_build_slug_sed() {\n'
+            "    local cont=$'\\200-\\277'\n"
+            "    local r220_277=$'\\220-\\277'\n"
+            "    local r361_363=$'\\361-\\363'\n"
+            "    local r200_217=$'\\200-\\217'\n"
+            "    local r240_277=$'\\240-\\277'\n"
+            "    local r341_354=$'\\341-\\354'\n"
+            "    local r200_237=$'\\200-\\237'\n"
+            "    local r356_357=$'\\356-\\357'\n"
+            "    local r302_337=$'\\302-\\337'\n"
+            '    _REMEMBER_SLUG_SED=(\n'
+            '        -e "s/"$\'\\360\'"[$r220_277][$cont][$cont]/--/g"\n'
+            '        -e "s/[$r361_363][$cont][$cont][$cont]/--/g"\n'
+            '        -e "s/"$\'\\364\'"[$r200_217][$cont][$cont]/--/g"\n'
+            '        -e "s/"$\'\\340\'"[$r240_277][$cont]/-/g"\n'
+            '        -e "s/[$r341_354][$cont][$cont]/-/g"\n'
+            '        -e "s/"$\'\\355\'"[$r200_237][$cont]/-/g"\n'
+            '        -e "s/[$r356_357][$cont][$cont]/-/g"\n'
+            '        -e "s/[$r302_337][$cont]/-/g"\n'
+            "        -e 's/[^a-zA-Z0-9]/-/g'\n"
+            '    )\n'
+            '}\n'
+            '_remember_build_slug_sed\n',
+        ),
+    ],
+    "scripts/lib-memory-dir.sh": [
+        # #695: `[A-Za-z]:` in the drive-form `case` patterns below is a
+        # bracket RANGE, matched by the locale's collation rather than by
+        # byte value. `local LC_ALL=C` scopes byte semantics to the function
+        # and restores the caller's locale on return. Measured on glibc, a
+        # `case` range does not actually move with the locale (only `[[ =~ ]]`
+        # does -- see tests/test_locale_ranges_695.py for the matrix), so this
+        # is not a behaviour change on any platform; it is the same one-line
+        # rule applied uniformly so the scanner has no exception to carry.
+        # Each pair carries the line AFTER the opener as well, so that
+        # `old_code` is not a prefix of `new_code`. A prefix would leave the
+        # old text present inside the substituted result, and
+        # tests/test_sanctioned_divergence_state_440.py asserts exactly that it
+        # is gone -- the invariant every existing allowance here already meets
+        # by inserting between two lines rather than before the first.
+        (
+            '_resolve_remember_dir() {\n'
+            '    local data_dir="$1"\n',
+            '_resolve_remember_dir() {\n'
+            '    local LC_ALL=C  # bracket ranges below are byte-wise, not collated (#695)\n'
+            '    local data_dir="$1"\n',
+        ),
+        (
+            '_set_store_root() {\n'
+            '    local data_dir="$1" prefix\n',
+            '_set_store_root() {\n'
+            '    local LC_ALL=C  # bracket ranges below are byte-wise, not collated (#695)\n'
+            '    local data_dir="$1" prefix\n',
+        ),
+        (
+            'elif [ "${#_cfg_sources[@]}" -gt 0 ]; then\n'
+            '    "${PYTHON:-python3}" - "$_merged_cfg" "${_cfg_sources[@]}" > /dev/null 2>&1 <<\'PYMERGE\'',
+            'elif [ "${#_cfg_sources[@]}" -gt 0 ]; then\n'
+            '    ' + _LAZY_PYTHON_GUARD +
+            '    "${PYTHON:-python3}" - "$_merged_cfg" "${_cfg_sources[@]}" > /dev/null 2>&1 <<\'PYMERGE\'',
+        ),
+        (
         '_merged_cfg="${SYS_TMPDIR}/remember-config-$$.json"\n\n' +
         '(umask 077; : > "$_merged_cfg") 2>/dev/null || true\n\n' +
         '_cfg_sources=()\n' +
@@ -161,7 +270,32 @@ _SANCTIONED_DIVERGENCE = {
         'if [ -z "$_merged_cfg" ]; then\n' +
         '    :\n' +
         'elif [ "${#_cfg_sources[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then',
-    ),
+        ),
+        (
+            "_existing_trap=$(trap -p EXIT 2>/dev/null | sed \"s/trap -- '//;s/' EXIT//\")\n"
+            "if [ -n \"$_existing_trap\" ]; then\n"
+            "    trap \"${_existing_trap}; rm -f '${_merged_cfg}'\" EXIT\n"
+            "else\n"
+            "    trap \"rm -f '${_merged_cfg}'\" EXIT\n"
+            "fi\n"
+            "unset _existing_trap\n",
+            # #679 (part of #660): `trap -p` is a builtin -- `sed` was the
+            # only fork this line paid, stripping four characters at a
+            # fixed offset. Parameter expansion does the identical strip
+            # with no behaviour change: a prefix/suffix a string does not
+            # have is left unchanged, matching sed on empty input the same
+            # way (no existing trap -> both leave _existing_trap empty).
+            "_t=$(trap -p EXIT 2>/dev/null)\n"
+            "_existing_trap=\"${_t#trap -- \\'}\"\n"
+            "_existing_trap=\"${_existing_trap%\\' EXIT}\"\n"
+            "if [ -n \"$_existing_trap\" ]; then\n"
+            "    trap \"${_existing_trap}; rm -f '${_merged_cfg}'\" EXIT\n"
+            "else\n"
+            "    trap \"rm -f '${_merged_cfg}'\" EXIT\n"
+            "fi\n"
+            "unset _existing_trap _t\n",
+        ),
+    ],
 }
 
 RECORD_NAME = "case-divergence"
@@ -221,6 +355,15 @@ def _env(home: Path, project: Path) -> dict:
         "HOME": str(home),
         "CLAUDE_PROJECT_DIR": str(project),
         "CLAUDE_PLUGIN_ROOT": str(REPO_ROOT),
+        # The case-divergence notice is written in the hook's deferred phase
+        # since #660, so by default it lands shortly AFTER the hook exits and
+        # every assertion in this file reads it too early. Run that phase
+        # inline instead of turning nine assertions into polls: what these
+        # tests are about is which notice gets written and how often, not when.
+        # That the deferral itself happens, and still lands, is covered by
+        # tests/test_session_start_deferred_capture_gap_660.py against the
+        # DEFAULT (deferred) path.
+        "REMEMBER_DEFER": "0",
     })
     return env
 

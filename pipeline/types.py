@@ -120,10 +120,33 @@ class ExtractResult:
         envelope_unreadable: True when the transcript file named by
             ``envelope`` could not even be OPENED (an ``OSError`` --
             permission error, bad mount, vanished between listing and
-            open) -- never true when the file was opened and read to
-            exhaustion (or found empty) and simply never contained a line
-            naming a known host shape (#478). ``envelope`` is
-            "unrecognised" in both cases; this is what tells them apart.
+            open) -- never true when the file was opened at all, whether
+            that read hit genuine exhaustion (or an empty file) or gave up
+            at the scan cap (``envelope_capped``, below), since neither of
+            those ever contained a line naming a known host shape (#478,
+            #556). ``envelope`` is "unrecognised" in every case; this is
+            what tells "could not open it" apart from the other two.
+        envelope_capped: True when ``envelope`` is "unrecognised" because
+            the scan gave up after ``extract._ENVELOPE_SNIFF_SCAN_CAP``
+            parseable-but-unplaceable lines, rather than because the file
+            was read to genuine exhaustion (or found empty) without ever
+            naming a known host shape (#556). Never true together with
+            ``envelope_unreadable`` -- a file that could not be opened
+            never reaches the scan -- and never true for a resolved
+            envelope. Lets a caller (``pipeline.haiku``'s fallback warning)
+            name the cap specifically instead of lumping it in with
+            "unrecognised shape".
+        envelope_has_unmapped_step: True when ``envelope`` resolved to a
+            known host (currently only ever set for "antigravity") but the
+            read span contained at least one step whose own ``type`` this
+            build's ``pipeline.host`` adapter cannot map to a role (#575).
+            Distinct from an ordinary 0-exchange span: that reports the
+            same ``human_count``/``assistant_count`` of 0 this can, but
+            this is only ever true when a step was actually seen and
+            dropped, so a caller (``scripts/save-session.sh``) can route
+            such a span through the same #450 quarantine an "unrecognised"
+            envelope gets, rather than reporting it as a genuinely quiet
+            session that is safe to advance past for good.
     """
 
     exchanges: str = ""
@@ -135,6 +158,8 @@ class ExtractResult:
     skip_lines: int = 0
     unread_sidecar_unreadable: bool = False
     envelope_unreadable: bool = False
+    envelope_capped: bool = False
+    envelope_has_unmapped_step: bool = False
 
 
 @dataclass
