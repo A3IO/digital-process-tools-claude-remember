@@ -25,6 +25,10 @@ from pathlib import Path
 import pytest
 
 from ._bash_runner import resolve_bash
+from .test_plugin_promo_574 import _env as _promo_env
+from .test_plugin_promo_574 import _payload as _promo_payload
+from .test_plugin_promo_574 import _store as _promo_store
+from .test_plugin_promo_574 import _write_installed as _promo_write_installed
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap-dirs.sh"
@@ -292,21 +296,40 @@ def test_remember_trace_unset_is_not_the_opt_out(tmp_path):
 @pytest.mark.xfail(
     sys.platform == "win32",
     reason=(
-        "round-2 #690, undiagnosed: on windows-latest, `bash -x "
-        "session-start-hook.sh` exits 0 with zero stdout bytes even though "
-        "the six tests above it in this file pass on the same runner (so "
-        "bash resolution and path handling are not the cause). Whether the "
-        "_REMEMBER_CTX_FILE buffer redirect (session-start-hook.sh:1527-1542, "
-        "1969-1972) never engages under trace on Git Bash, or engages and the "
-        "flush branch is never reached, has not been established -- it needs "
-        "a Windows runner to answer. Left as a loud xfail rather than a "
-        "silent skip so this stays visible until someone can actually step "
-        "through it there; strict=False so a fix flips this to XPASS instead "
-        "of a build failure, which is the signal to remove the marker. "
-        "Scoped to AssertionError specifically -- an unrelated crash on this "
-        "leg (a TimeoutExpired, a FileNotFoundError from a missing bash) "
-        "must still fail the build rather than being absorbed as if it were "
-        "this same, already-documented symptom."
+        "round-2 #690: on windows-latest, `bash -x session-start-hook.sh` "
+        "exits 0 with zero stdout bytes even though the six tests above it "
+        "in this file pass on the same runner. PR #733's own CI (the first "
+        "real windows-latest evidence #712 ever had) found the actual "
+        "mechanism: this test (and, before this fix, TestCtxBufferSkippedUnderTrace "
+        "below) called `bash [..., str(SESSION_START)]` -- an unnormalized "
+        "pathlib str() on a WindowsPath renders pure backslashes with no "
+        "forward slash at all, and session-start-hook.sh's own self-location "
+        "(`_HOOK_DIR='${BASH_SOURCE[0]%/*}'`, line ~60) has no fallback for "
+        "that shape: with zero '/' in BASH_SOURCE[0] the pattern strip is a "
+        "no-op, `_HOOK_DIR` becomes '.', and `source './resolve-paths.sh'` "
+        "fails from whatever cwd pytest happened to be in -- resolve-paths.sh's "
+        "own `|| exit 0` then exits clean with nothing printed, exactly this "
+        "symptom. This is the same test-harness bug test_windows_native_hook_cwd_448.py "
+        "already hit and fixed once (its own docstring: 'broke session-start-hook.sh's "
+        "own self-location on the real windows-latest CI leg... a harness bug, not "
+        "a finding about the fix') and the same convention "
+        "tests/test_hooks_json.py established for exactly this reason -- this file's "
+        "own real-hook invocation had not been updated to follow it. Now fixed here "
+        "(`SESSION_START.as_posix()` throughout this file, matching the rest of the "
+        "suite); production is unaffected either way, since hooks.json always invokes "
+        "via a literal `${CLAUDE_PLUGIN_ROOT}/scripts/...` shape that guarantees at "
+        "least one forward slash regardless of platform. #712's OWN fix -- skipping "
+        "session-start-hook.sh's _REMEMBER_CTX_FILE buffer/fd-swap under an active "
+        "trace (see TestCtxBufferSkippedUnderTrace below) -- remains in place as a "
+        "harmless, precedent-matching defensive improvement, but is very likely NOT "
+        "what was causing the originally observed symptom; the path bug above is. "
+        "Left as a loud xfail rather than removed outright because this repo has "
+        "still not seen a green windows-latest run of this exact test: strict=False "
+        "so that run flips this to XPASS instead of a build failure, which is the "
+        "signal to remove the marker for good. Scoped to AssertionError specifically "
+        "-- an unrelated crash on this leg (a TimeoutExpired, a FileNotFoundError "
+        "from a missing bash) must still fail the build rather than being absorbed "
+        "as if it were this same, already-documented symptom."
     ),
     strict=False,
     raises=AssertionError,
@@ -340,7 +363,7 @@ def test_the_real_hook_traces_past_the_bootstrap(tmp_path):
     # can split mid-character, making the stream undecodable as strict UTF-8.
     # A test that dies decoding its evidence proves nothing about the trace.
     raw = subprocess.run(
-        [BASH, "-x", str(SESSION_START)],
+        [BASH, "-x", SESSION_START.as_posix()],
         input=payload.encode("utf-8"),
         capture_output=True,
         timeout=120,
@@ -363,3 +386,106 @@ def test_the_real_hook_traces_past_the_bootstrap(tmp_path):
         "bootstrap-dirs.sh redirects fd 2 -- a trace that stops there reads "
         "exactly like a complete profile of a fast hook (#690)"
     )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "these fixtures are borrowed from test_plugin_promo_574.py "
+        "(_env/_payload/_store/_write_installed), whose own module-level "
+        "pytestmark already declares 'bash hook subprocess + POSIX "
+        "semantics -- not portable to Windows runners'. Confirmed the hard "
+        "way on PR #733's windows-latest CI (all 4 legs, 3.9-3.12): the hook "
+        "itself runs to completion and prints its normal plain-text context "
+        "('=== REMEMBER ===...') -- proof the #712 path-normalization fix "
+        "(SESSION_START.as_posix(), see test_the_real_hook_traces_past_the_bootstrap "
+        "above) is genuinely working end to end on Windows -- but the "
+        "plugin-promo systemMessage wrapper itself never fires there, most "
+        "likely because _env()'s HOME/CLAUDE_PROJECT_DIR/REMEMBER_DIR are "
+        "raw str(Path) rather than normalized, and something downstream of "
+        "that (installed_plugins.json detection, most likely) then reads as "
+        "'cannot tell', which the promo mechanism -- by design -- suppresses "
+        "exactly like a confirmed install (#574 decision 3). Making the "
+        "whole plugin-promo subsystem Windows-portable is what #574's own "
+        "authors already declined to do; it is out of scope for #712, which "
+        "is about the trace/fd-swap guard below, not about promo delivery. "
+        "Skipped here rather than reworked, matching the fixture source's "
+        "own documented limitation, so this class does not claim Windows "
+        "coverage it cannot back."
+    ),
+)
+class TestCtxBufferSkippedUnderTrace:
+    """#712: the test above is the only one in this file that exercises
+    session-start-hook.sh's OWN `_REMEMBER_CTX_FILE` buffer/fd-swap -- the
+    six neighbours above it only source bootstrap-dirs.sh, which never
+    touches that mechanism. These tests pin the guard added for #712
+    directly (skip the buffer entirely whenever a trace is active) using an
+    observable that is NOT Windows-portable (see the skipif above): the
+    plugin-promo `systemMessage` only ever reaches stdout via that same
+    buffer, so its presence or absence is a direct proxy for "did the
+    buffer engage" on every platform this class actually runs on.
+    """
+
+    def test_positive_control_promo_shows_without_trace(self, tmp_path):
+        """Must-fire control: with the buffer writable and untraced, a
+        genuinely-not-installed plugin's promo fires. Without this, the
+        negative cases below would pass just as well against an emitter
+        that never speaks at all."""
+        home, project, remember = _promo_store(tmp_path)
+        _promo_write_installed(home, {})
+
+        result = subprocess.run(
+            [BASH, SESSION_START.as_posix()],
+            input=_promo_payload(),
+            env=_promo_env(home, project, remember),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "systemMessage" in result.stdout
+
+    def test_buffer_skipped_under_bash_x(self, tmp_path):
+        """The actual #712 guard: an active xtrace must skip the buffer, so
+        the promo (which can only reach stdout through it) never fires --
+        the same visible trade bootstrap-dirs.sh's own fd guard already
+        makes for a trace an operator deliberately started."""
+        home, project, remember = _promo_store(tmp_path)
+        _promo_write_installed(home, {})
+
+        result = subprocess.run(
+            [BASH, "-x", SESSION_START.as_posix()],
+            input=_promo_payload().encode("utf-8"),
+            env=_promo_env(home, project, remember),
+            capture_output=True,
+            timeout=60,
+        )
+        stdout = result.stdout.decode("utf-8", errors="replace")
+
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert "systemMessage" not in stdout, (
+            "an active xtrace must skip the _REMEMBER_CTX_FILE buffer/fd-swap "
+            "entirely (#712) -- if this fires, the buffer engaged under trace, "
+            "which is the exact interaction hypothesised to be losing "
+            "session-start-hook.sh's stdout on windows-latest"
+        )
+
+    def test_buffer_skipped_under_remember_trace(self, tmp_path):
+        """REMEMBER_TRACE=1 is the same explicit opt-out bootstrap-dirs.sh
+        already honours for its own fd 2 redirect -- it must skip this
+        buffer too, not only the `-x` case above."""
+        home, project, remember = _promo_store(tmp_path)
+        _promo_write_installed(home, {})
+
+        result = subprocess.run(
+            [BASH, SESSION_START.as_posix()],
+            input=_promo_payload(),
+            env=_promo_env(home, project, remember, {"REMEMBER_TRACE": "1"}),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "systemMessage" not in result.stdout
