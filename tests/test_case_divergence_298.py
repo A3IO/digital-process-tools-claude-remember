@@ -125,7 +125,7 @@ def _apply_sanctioned_divergence(ref_code: str, rel: str) -> str:
     - Neither is on origin/main: genuinely stale. origin/main moved again and
       this allowance needs re-deriving, not blindly (re-)applied.
 
-    A file may carry more than one allowance (#429 and #662 both touch
+    A file may carry more than one allowance (#429 and #726 both touch
     lib-memory-dir.sh); they are applied in order, each judged on its own.
     """
     for old_code, new_code in _SANCTIONED_DIVERGENCE.get(rel, ()):
@@ -241,13 +241,18 @@ _SANCTIONED_DIVERGENCE = {
             '    local LC_ALL=C  # bracket ranges below are byte-wise, not collated (#695)\n'
             '    local data_dir="$1" prefix\n',
         ),
-        (
-            'elif [ "${#_cfg_sources[@]}" -gt 0 ]; then\n'
-            '    "${PYTHON:-python3}" - "$_merged_cfg" "${_cfg_sources[@]}" > /dev/null 2>&1 <<\'PYMERGE\'',
-            'elif [ "${#_cfg_sources[@]}" -gt 0 ]; then\n'
-            '    ' + _LAZY_PYTHON_GUARD +
-            '    "${PYTHON:-python3}" - "$_merged_cfg" "${_cfg_sources[@]}" > /dev/null 2>&1 <<\'PYMERGE\'',
-        ),
+        # #662's own tuple (the `_LAZY_PYTHON_GUARD` insertion into the no-jq
+        # elif, on its own, pre-#726 two-argument invocation) is gone (#734):
+        # #726 (below) composed directly on top of it and shipped the guard
+        # and the three-argument invocation together in one already-merged
+        # commit, so origin/main never again holds the guard paired with the
+        # old two-argument call -- neither this tuple's old_code (pre-guard)
+        # nor its new_code (guard + two-arg) is a substring of origin/main
+        # once #726 lands, which is exactly the "neither old nor new" failure
+        # #734 saw. The guard's insertion point is still pinned -- it is the
+        # first line of the #726 tuple's own new_code below, so removing this
+        # redundant tuple loses no coverage of #662's actual invariant (the
+        # guard still precedes the python invocation on the no-jq path).
         (
         '_merged_cfg="${SYS_TMPDIR}/remember-config-$$.json"\n\n' +
         '(umask 077; : > "$_merged_cfg") 2>/dev/null || true\n\n' +
@@ -294,6 +299,84 @@ _SANCTIONED_DIVERGENCE = {
             "    trap \"rm -f '${_merged_cfg}'\" EXIT\n"
             "fi\n"
             "unset _existing_trap _t\n",
+        ),
+        (
+            '_project_cfg="${REMEMBER_DIR}/config.json"\n'
+            'SYS_TMPDIR="${TMPDIR:-/tmp}"\n',
+            # #726: the project layer's `haiku` block is untrusted when
+            # REMEMBER_DIR sits inside the project checkout (the operator's own
+            # clone could otherwise choose the nested summarizer's credential, or
+            # flip whether ANTHROPIC_API_KEY is stripped). This records that
+            # verdict into `_project_cfg_haiku_untrusted` before the merge runs.
+            '_project_cfg="${REMEMBER_DIR}/config.json"\n'
+            '\n'
+            '_classify_project_cfg_haiku_trust() {\n'
+            '    local LC_ALL=C  # bracket ranges below are byte-wise, not collated (#695)\n'
+            '    case "$_data_dir_raw" in\n'
+            '        /*|~*|[A-Za-z]:/*|[A-Za-z]:\\\\*) _project_cfg_haiku_untrusted=0 ;;\n'
+            '        *) _project_cfg_haiku_untrusted=1 ;;\n'
+            '    esac\n'
+            '}\n'
+            '_classify_project_cfg_haiku_trust\n'
+            '\n'
+            'SYS_TMPDIR="${TMPDIR:-/tmp}"\n',
+        ),
+        (
+            'elif [ "${#_cfg_sources[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then\n'
+            '    jq -s \'reduce .[] as $x ({}; . * $x) | with_entries(select(.key | startswith("_") | not))\' "${_cfg_sources[@]}" > "$_merged_cfg" 2>/dev/null \\\n'
+            '        || cp "$_bundled_cfg" "$_merged_cfg" 2>/dev/null\n',
+            # #726: when the project layer's `haiku` block is untrusted, it is
+            # always the LAST element `-s` slurps (project cfg is appended last
+            # to `_cfg_sources` when present) -- deleted before the reduce, never
+            # merged in at all. The filter is kept on ONE line (rather than the
+            # more readable multi-line form first shipped): a literal newline
+            # inside this quoted argument reaches the jq process's own argv,
+            # and tests/spawn_counting.py's shim logs a spawn as `printf "%s
+            # %s\n" "$name" "$*"` then callers split the log on newlines -- so
+            # a multi-line filter here does not cost one more process, it
+            # costs the SAME single process several extra phantom lines in
+            # every spawn-count budget this merge appears in. Found via a
+            # macOS-only (stock bash 3.2) CI failure in
+            # tests/test_post_tool_hook_spawns.py after the multi-line form
+            # first landed: 4 phantom lines from one real jq call pushed the
+            # count from comfortably under budget to one over it.
+            'elif [ "${#_cfg_sources[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then\n'
+            '    _strip_project_haiku="false"\n'
+            '    [ "$_project_cfg_haiku_untrusted" = "1" ] && [ -f "$_project_cfg" ] && _strip_project_haiku="true"\n'
+            '    jq -s --argjson strip_last_haiku "$_strip_project_haiku" \'(if $strip_last_haiku then (.[-1] |= del(.haiku)) else . end) | reduce .[] as $x ({}; . * $x) | with_entries(select(.key | startswith("_") | not))\' "${_cfg_sources[@]}" > "$_merged_cfg" 2>/dev/null \\\n'
+            '        || cp "$_bundled_cfg" "$_merged_cfg" 2>/dev/null\n',
+        ),
+        (
+            '    declare -f _remember_python >/dev/null 2>&1 && _remember_python\n'
+            '    "${PYTHON:-python3}" - "$_merged_cfg" "${_cfg_sources[@]}" > /dev/null 2>&1 <<\'PYMERGE\' || cp "$_bundled_cfg" "$_merged_cfg" 2>/dev/null\n'
+            'import json\n',
+            # #726: the same untrusted-source verdict, threaded through the
+            # no-jq Python fallback.
+            '    declare -f _remember_python >/dev/null 2>&1 && _remember_python\n'
+            '    _untrusted_haiku_source=""\n'
+            '    [ "$_project_cfg_haiku_untrusted" = "1" ] && _untrusted_haiku_source="$_project_cfg"\n'
+            '    "${PYTHON:-python3}" - "$_merged_cfg" "$_untrusted_haiku_source" "${_cfg_sources[@]}" > /dev/null 2>&1 <<\'PYMERGE\' || cp "$_bundled_cfg" "$_merged_cfg" 2>/dev/null\n'
+            'import json\n',
+        ),
+        (
+            'out_path = sys.argv[1]\n'
+            'merged = {}\n'
+            'for path in sys.argv[2:]:\n'
+            '    with open(path) as f:\n'
+            '        merged = deep_merge(merged, json.load(f))\n'
+            'merged = {k: v for k, v in merged.items() if not str(k).startswith("_")}\n',
+            # #726: the Python fallback's own strip of the untrusted `haiku` key,
+            # mirroring the jq path's `del(.haiku)` on the last element.
+            'out_path = sys.argv[1]\n'
+            'untrusted_haiku_path = sys.argv[2]\n'
+            'merged = {}\n'
+            'for path in sys.argv[3:]:\n'
+            '    with open(path) as f:\n'
+            '        data = json.load(f)\n'
+            '    if untrusted_haiku_path and path == untrusted_haiku_path and isinstance(data, dict):\n'
+            '        data = {k: v for k, v in data.items() if k != "haiku"}\n'
+            '    merged = deep_merge(merged, data)\n'
+            'merged = {k: v for k, v in merged.items() if not str(k).startswith("_")}\n',
         ),
     ],
 }
@@ -811,18 +894,22 @@ def test_the_per_tool_call_path_is_not_touched(tmp_path):
     Strip the comments from both sides — the same one-liner the arm above
     already uses — and every executable byte stays pinned exactly as before.
 
-    One EXECUTABLE line in `lib-memory-dir.sh` is allowed to differ, via
-    `_SANCTIONED_DIVERGENCE` below: #429 replaced a PID-suffixed literal tmp
-    path with `mktemp`, closing a predictable-symlink TOCTOU whose write
-    (traced and reproduced in `tests/test_predictable_tmp_429.py`) can carry
-    a live `haiku.oauth_token` to an attacker-chosen path. That is a real,
-    deliberate spawn added to Pass 2 of the config merge -- exactly the kind
-    of change this guard exists to surface, not to forbid outright -- and it
-    runs only on the resolving run (first tool call of a session, or after a
-    config edit), never on the per-tool-call fast path this guard actually
-    protects. The substitution is applied to the origin/main side before the
-    compare, so it is scoped to this one sanctioned line: anything else that
-    diverges from origin/main in either file still fails this test.
+    Some EXECUTABLE lines in `lib-slug.sh`/`lib-memory-dir.sh` are allowed to
+    differ from origin/main, via `_SANCTIONED_DIVERGENCE` below -- one entry
+    per deliberate change, each judged on its own by
+    `_apply_sanctioned_divergence`. See that dict's own per-entry comments
+    for what each one is and why (e.g. #429 replaced a PID-suffixed literal
+    tmp path with `mktemp`, closing a predictable-symlink TOCTOU whose write
+    can carry a live `haiku.oauth_token` to an attacker-chosen path; #726
+    added an untrusted-project-config classification and threaded it through
+    both the jq and Python merge paths). Each is a real, deliberate spawn or
+    behavior change added to Pass 2 of the config merge -- exactly the kind
+    of change this guard exists to surface, not to forbid outright -- and
+    none of them touch the per-tool-call fast path this guard actually
+    protects. Substitutions are applied to the origin/main side before the
+    compare, so they are scoped to exactly the sanctioned lines: anything
+    else that diverges from origin/main in either file still fails this
+    test.
     """
     body = POST_TOOL.read_text(encoding="utf-8")
     code = "\n".join(line for line in body.splitlines()
